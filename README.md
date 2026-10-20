@@ -15,7 +15,7 @@ cargo run --release -- estimate --parameters-b 14 --format Q4_K_M --device-memor
 cargo run --release -- run --model .\models\qwen.gguf --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
 ```
 
-GGUF workflows need llama.cpp executables on `PATH`; converting a Hugging Face model folder also needs `LLAMA_CPP_DIR`. Python plus the matching optional dependencies are required only when a workflow invokes one of the upstream ML adapters.
+GGUF workflows need llama.cpp executables on `PATH`; converting a Hugging Face model folder also needs `LLAMA_CPP_DIR`. Python plus the installed QuantLab package and matching optional dependencies are required only when a workflow invokes one of the upstream ML adapters. From this checkout, install an adapter extra with `python -m pip install -e ".[gpu]"` (choose the relevant extra below).
 
 You can pass a parameter count directly when it cannot be inferred from the model name:
 
