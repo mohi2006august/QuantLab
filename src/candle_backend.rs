@@ -66,6 +66,48 @@ pub fn evaluate_perplexity(path: &Path, text_path: &Path, stride: usize, max_len
     }))
 }
 
+pub fn benchmark(path: &Path, repeats: usize, prompt_tokens: usize, generation_tokens: usize, batch_size: usize) -> Result<Value> {
+    if repeats == 0 || prompt_tokens == 0 || generation_tokens == 0 || batch_size == 0 {
+        bail!("Benchmark repeats, batch size, and token counts must be positive.");
+    }
+    let mut model = CandleLlama::load(path)?;
+    let prompt_source = "QuantLab benchmark prompt. ".repeat(prompt_tokens);
+    let encoded = model.tokenizer.encode(prompt_source, true).map_err(anyhow::Error::msg)?;
+    if encoded.get_ids().len() < prompt_tokens {
+        bail!("Could not construct the requested number of benchmark prompt tokens.");
+    }
+    let prompt_ids = &encoded.get_ids()[..prompt_tokens];
+    if prompt_tokens + generation_tokens > model.config.max_position_embeddings {
+        bail!("Benchmark prompt and generation exceed the model context window.");
+    }
+    for _ in 0..batch_size {
+        model.generate_tokens(prompt_ids, generation_tokens)?;
+    }
+    let mut rates = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let started = std::time::Instant::now();
+        let mut generated_tokens = 0usize;
+        for _ in 0..batch_size {
+            generated_tokens += model.generate_tokens(prompt_ids, generation_tokens)?.len();
+        }
+        rates.push(generated_tokens as f64 / started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE));
+    }
+    let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+    let variance = if rates.len() > 1 {
+        rates.iter().map(|rate| (rate - mean).powi(2)).sum::<f64>() / (rates.len() - 1) as f64
+    } else {
+        0.0
+    };
+    Ok(json!({
+        "tok_s": mean,
+        "tok_s_std": variance.sqrt(),
+        "repeats": repeats,
+        "runtime": "candle",
+        "architecture": "llama",
+        "measurement": "sequential_generation",
+    }))
+}
+
 pub fn evaluate_prompt_suite(path: &Path, suite: &Value, max_new_tokens: usize, judge_path: Option<&Path>) -> Result<Value> {
     let items = suite.as_array().context("Prompt suite must be a JSON array")?;
     if items.is_empty() || max_new_tokens == 0 {
@@ -152,6 +194,11 @@ impl CandleLlama {
 
     fn generate(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let input_ids = self.tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        let generated = self.generate_tokens(&input_ids, max_new_tokens)?;
+        self.tokenizer.decode(&generated, true).map_err(anyhow::Error::msg)
+    }
+
+    fn generate_tokens(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
         if input_ids.is_empty() { bail!("Prompt must encode to at least one token."); }
         if input_ids.len() >= self.config.max_position_embeddings {
             bail!("Prompt exceeds the model context window.");
@@ -161,7 +208,7 @@ impl CandleLlama {
         let mut previous = Vec::new();
         for index in 0..max_new_tokens {
             let (token_slice, offset) = if index == 0 {
-                (input_ids.as_slice(), 0)
+                (input_ids, 0)
             } else {
                 previous.clear();
                 previous.push(*generated.last().unwrap());
@@ -178,7 +225,7 @@ impl CandleLlama {
             if is_eos { break; }
             generated.push(next_token);
         }
-        self.tokenizer.decode(&generated, true).map_err(anyhow::Error::msg)
+        Ok(generated)
     }
 }
 

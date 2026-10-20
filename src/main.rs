@@ -42,7 +42,7 @@ enum Commands {
         calibration_file: Option<PathBuf>,
         #[arg(long)]
         seed: Option<u64>,
-        #[arg(long, value_parser = ["llama.cpp", "vllm"])]
+        #[arg(long, value_parser = ["llama.cpp", "vllm", "candle"])]
         benchmark: Option<String>,
         #[arg(long, default_value = "auto")]
         kv_cache_dtype: String,
@@ -86,7 +86,7 @@ enum Commands {
     Benchmark {
         #[arg(long)]
         model_path: String,
-        #[arg(long, default_value = "llama.cpp", value_parser = ["llama.cpp", "vllm"])]
+        #[arg(long, default_value = "llama.cpp", value_parser = ["llama.cpp", "vllm", "candle"])]
         backend: String,
         #[arg(long, default_value_t = 3)]
         repeats: usize,
@@ -321,6 +321,34 @@ fn benchmark_command(
     kv_cache_dtypes: Option<&str>,
     output: Option<&std::path::Path>,
 ) -> Result<()> {
+    if backend == "candle" {
+        if !candle_backend::supports_local_model(std::path::Path::new(model_path)) {
+            bail!("The Candle benchmark requires a supported local Llama safetensors model.");
+        }
+        let batches = parse_usize_list(batch_sizes, batch_size.unwrap_or(1))?;
+        let prompts = parse_usize_list(prompt_token_sizes, prompt_tokens)?;
+        let generations = parse_usize_list(generation_token_sizes, generation_tokens)?;
+        let dtypes = parse_string_list(kv_cache_dtypes, kv_cache_dtype)?;
+        if dtypes.iter().any(|dtype| dtype != "auto") {
+            bail!("The Candle benchmark uses the model dtype for its KV cache; only auto is supported.");
+        }
+        let mut measurements = Vec::new();
+        for batch in batches {
+            for prompt in &prompts {
+                for generation in &generations {
+                    let metrics = candle_backend::benchmark(
+                        std::path::Path::new(model_path), repeats, *prompt, *generation, batch,
+                    )?;
+                    measurements.push(json!({"batch_size": batch, "prompt_tokens": prompt,
+                        "generation_tokens": generation, "kv_cache_dtype": "auto", "metrics": metrics}));
+                }
+            }
+        }
+        let rendered = serde_json::to_string_pretty(&json!({"backend": "candle", "measurements": measurements}))?;
+        println!("{rendered}");
+        if let Some(path) = output { fs::write(path, format!("{rendered}\n"))?; }
+        return Ok(());
+    }
     if backend == "vllm" {
         let batches = parse_usize_list(batch_sizes, batch_size.unwrap_or(1))?;
         let prompts = parse_usize_list(prompt_token_sizes, prompt_tokens)?;
@@ -951,8 +979,8 @@ fn run_matrix(
     if batch_size == 0 || prompt_tokens == 0 || generation_tokens == 0 || repeats == 0 {
         bail!("Batch size, token counts, and repeats must be positive.");
     }
-    if benchmark.is_some_and(|backend| !["llama.cpp", "vllm"].contains(&backend)) {
-        bail!("Benchmark backend must be llama.cpp or vllm.");
+    if benchmark.is_some_and(|backend| !["llama.cpp", "vllm", "candle"].contains(&backend)) {
+        bail!("Benchmark backend must be llama.cpp, vllm, or candle.");
     }
     let methods = methods_spec.split(',').map(|item| {
         let (method, variant) = item.trim().split_once(':').context("Methods must use method:variant syntax")?;
@@ -1053,6 +1081,8 @@ fn run_matrix(
             let task_scores = task_result.as_ref().map(|value| value["results"].to_string());
             let metrics = if benchmark == Some("llama.cpp") && method == "gguf" {
                 Some(llama_bench_one(&artifact, repeats, prompt_tokens, generation_tokens, kv_cache_dtype, batch_size)?)
+            } else if benchmark == Some("candle") {
+                Some(candle_backend::benchmark(&artifact, repeats, prompt_tokens, generation_tokens, batch_size)?)
             } else if benchmark == Some("vllm") {
                 Some(call_python_adapter("vllm_benchmark", &[artifact.clone().into_os_string(), repeats.to_string().into(), prompt_tokens.to_string().into(), generation_tokens.to_string().into(), kv_cache_dtype.into(), batch_size.to_string().into()])?)
             } else { None };
