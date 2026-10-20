@@ -4,7 +4,7 @@ QuantLab runs reproducible local LLM quantization matrices, measures quality and
 
 ## Rust CLI
 
-Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. Rust owns the CLI, matrix orchestration, SQLite results, reports, and configuration. Upstream ML libraries without practical Rust APIs (bitsandbytes, GPTQ, AWQ, FP8, Transformers, lm-eval, and vLLM) run through narrow Python operation adapters; they no longer re-enter the Python CLI. Both Rust and Python test workflows run in GitHub Actions.
+Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. Rust owns the CLI, orchestration, persistence, and reporting. Local Llama safetensors evaluation uses Candle in Rust. BnB/GPTQ/AWQ/FP8 quantization, lm-eval, vLLM, judging, and activation-captured sensitivity retain narrow Python adapters for their upstream ML implementations; they no longer re-enter the Python CLI. Both Rust and Python test workflows run in GitHub Actions.
 
 ## Quick start
 
@@ -15,7 +15,7 @@ cargo run --release -- estimate --parameters-b 14 --format Q4_K_M --device-memor
 cargo run --release -- run --model .\models\qwen.gguf --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
 ```
 
-GGUF workflows need llama.cpp executables on `PATH`; converting a Hugging Face model folder also needs `LLAMA_CPP_DIR`. Python plus the installed QuantLab package and matching optional dependencies are required only when a workflow invokes one of the upstream ML adapters. From this checkout, install an adapter extra with `python -m pip install -e ".[gpu]"` (choose the relevant extra below).
+GGUF workflows need llama.cpp executables on `PATH`; converting a Hugging Face model folder also needs `LLAMA_CPP_DIR`. To enable Candle CUDA, build with `--features cuda` and a compatible CUDA toolchain; otherwise Candle runs on CPU. `QUANTLAB_CANDLE_DTYPE` selects `f16` (default), `bf16`, or `f32`. Python plus the installed QuantLab package and matching optional dependencies are required only when a workflow invokes one of the remaining ML adapters. From this checkout, install an adapter extra with `python -m pip install -e ".[gpu]"` (choose the relevant extra below).
 
 You can pass a parameter count directly when it cannot be inferred from the model name:
 
@@ -41,7 +41,7 @@ Each matrix run records states and metrics in `quantlab-runs/results.sqlite` and
 
 ## Evaluation and analysis
 
-Rust `evaluate` supports GGUF perplexity and JSON prompt suites through llama.cpp, and invokes Transformers/lm-eval adapters for supported model formats and tasks. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. Evaluation can pass `--judge-model` for local judging. Rust `benchmark` supports llama.cpp and vLLM backends, including Cartesian sweeps through `--batch-sizes`, `--prompt-token-sizes`, `--generation-token-sizes`, and `--kv-cache-dtypes`. Rust `sensitivity` analyzes safetensors weights without loading the full model; `--calibration-file` invokes the activation-weighted analysis adapter.
+Rust `evaluate` uses llama.cpp for GGUF and Candle for local Llama-family safetensors models; unsupported architectures/formats use the Transformers adapter. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. `--judge-model` uses the optional Python judge adapter. Rust `benchmark` supports llama.cpp and vLLM backends, including Cartesian sweeps through `--batch-sizes`, `--prompt-token-sizes`, `--generation-token-sizes`, and `--kv-cache-dtypes`. Rust `sensitivity` analyzes safetensors weights without loading the full model; `--calibration-file` still uses Python to capture model activations.
 
 Rust and Python `publish` upload a local artifact folder to Hugging Face Hub using `HF_TOKEN` and require the source model's license identifier to create a model card. Check the model and dataset licenses before publishing. Publishing is an explicit separate command and is not invoked by `run`.
 

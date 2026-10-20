@@ -2,15 +2,25 @@
 name = "quantlab"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.85"
 description = "Local LLM quantization planning and workflow orchestration"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }
 
 [dev-dependencies]
 tempfile = "3"

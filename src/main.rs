@@ -7,6 +7,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{self, Command};
 
+mod candle_backend;
+
 #[derive(Parser)]
 #[command(name = "quantlab", version, about = "Plan and compare local LLM quantization")]
 struct Cli {
@@ -530,6 +532,30 @@ fn evaluate_command(
             result["custom"] = call_python_adapter("prompt_suite", &[
                 model.as_os_str().to_owned(), suite.as_os_str().to_owned(), max_new_tokens.to_string().into(), judge.into(),
             ])?;
+        }
+        if let Some(task_list) = tasks {
+            result["tasks"] = call_python_adapter("tasks", &[
+                model.as_os_str().to_owned(), task_list.into(), limit.map(|value| value.to_string()).unwrap_or_default().into(), seed.to_string().into(),
+            ])?;
+        }
+        let rendered = serde_json::to_string_pretty(&result)?;
+        println!("{rendered}");
+        if let Some(path) = output_path { fs::write(path, format!("{rendered}\n"))?; }
+        return Ok(());
+    }
+    if candle_backend::supports_local_model(model) {
+        if let Some(corpus) = text_file {
+            result["perplexity"] = candle_backend::evaluate_perplexity(model, corpus, stride, max_length)?;
+        }
+        if let Some(suite) = prompt_suite {
+            if let Some(judge) = judge_model {
+                result["custom"] = call_python_adapter("prompt_suite", &[
+                    model.as_os_str().to_owned(), suite.as_os_str().to_owned(), max_new_tokens.to_string().into(), judge.into(),
+                ])?;
+            } else {
+                let prompts: Value = serde_json::from_slice(&fs::read(suite).context("Could not read prompt suite")?)?;
+                result["custom"] = candle_backend::evaluate_prompt_suite(model, &prompts, max_new_tokens)?;
+            }
         }
         if let Some(task_list) = tasks {
             result["tasks"] = call_python_adapter("tasks", &[
