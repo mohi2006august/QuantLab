@@ -1,0 +1,13 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "methods": ["gguf:Q4_K_M", "gguf:Q5_K_M"],
+  "device": "rtx4090",
+  "output_dir": "quantlab-runs",
+  "benchmark": "llama.cpp",
+  "kv_cache_dtype": "q8_0",
+  "batch_size": 2048,
+  "prompt_tokens": 512,
+  "generation_tokens": 128,
+  "repeats": 3,
+  "seed": 1234
+}

@@ -1,0 +1,5 @@
+{
+  "name": "h100",
+  "memory_gb": 80,
+  "description": "NVIDIA H100 80 GB"
+}

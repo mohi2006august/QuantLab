@@ -8,9 +8,20 @@ version = "0.1.0"
 description = "Estimate and compare open LLM quantization configurations for local hardware."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
 authors = [{ name = "QuantLab contributors" }]
 dependencies = []
+
+[project.optional-dependencies]
+eval = ["torch>=2.2", "transformers>=4.45"]
+gpu = ["torch>=2.2", "transformers>=4.45", "bitsandbytes>=0.43", "psutil>=5.9"]
+gptq = ["gptqmodel"]
+awq = ["autoawq"]
+fp8 = ["llmcompressor", "datasets", "transformers>=4.45"]
+vllm = ["vllm", "psutil>=5.9"]
+lm-eval = ["lm-eval"]
+hub = ["huggingface_hub"]
+config = ["PyYAML>=6"]
+all = ["torch>=2.2", "transformers>=4.45", "bitsandbytes>=0.43", "gptqmodel", "autoawq", "llmcompressor", "datasets", "vllm", "lm-eval", "huggingface_hub", "PyYAML>=6"]
 
 [project.scripts]
 quantlab = "quantlab.cli:main"

@@ -1,4 +1,4 @@
-"""Rank candidate formats by fit and estimated precision."""
+"""Rank candidate formats by fit and measured quality where available."""
 
 from dataclasses import dataclass
 

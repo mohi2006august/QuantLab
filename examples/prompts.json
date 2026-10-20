@@ -1,0 +1,11 @@
+[
+  {
+    "id": "capital-france",
+    "prompt": "Answer with only the city name. What is the capital of France?",
+    "expected": "Paris"
+  },
+  {
+    "id": "greeting",
+    "prompt": "Write a short greeting."
+  }
+]

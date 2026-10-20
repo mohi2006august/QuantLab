@@ -1,0 +1,6 @@
+{
+  "texts": [
+    "Quantization reduces the storage size of model weights by representing values with fewer bits.",
+    "A representative calibration set helps activation-aware quantizers preserve important model behavior."
+  ]
+}

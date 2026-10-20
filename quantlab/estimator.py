@@ -1,6 +1,7 @@
 """Transparent first-pass model weight memory estimates."""
 
 from dataclasses import dataclass
+import math
 
 from quantlab.formats import QuantFormat
 
@@ -21,9 +22,9 @@ def estimate_memory(
     quant_format: QuantFormat,
     runtime_reserve_gib: float = 1.5,
 ) -> MemoryEstimate:
-    if parameters_b <= 0:
+    if not math.isfinite(parameters_b) or parameters_b <= 0:
         raise ValueError("Parameter count must be greater than zero.")
-    if runtime_reserve_gib < 0:
+    if not math.isfinite(runtime_reserve_gib) or runtime_reserve_gib < 0:
         raise ValueError("Runtime reserve cannot be negative.")
 
     weight_bytes = parameters_b * GB_BYTES * quant_format.bits_per_parameter / 8
