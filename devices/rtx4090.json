@@ -1,0 +1,5 @@
+{
+  "name": "rtx4090",
+  "memory_gb": 24,
+  "description": "NVIDIA GeForce RTX 4090"
+}
