@@ -4,7 +4,7 @@ QuantLab runs reproducible local LLM quantization matrices, measures quality and
 
 ## Rust CLI
 
-Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. The Rust CLI implements `doctor`, `estimate`, and `recommend` natively. `run`, `evaluate`, `benchmark`, `report`, `sensitivity`, and `publish` currently forward to the Python compatibility package. Both Rust and Python test workflows run in GitHub Actions.
+Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. The Rust CLI implements `doctor`, `estimate`, `recommend`, local GGUF quantization matrices (`run`), SQLite-backed HTML `report`, and llama.cpp `benchmark` natively. BnB/GPTQ/AWQ/FP8 runs, model `evaluate`, activation `sensitivity`, Hub `publish`, YAML configs, and vLLM benchmarking still use the Python compatibility backend because they depend on Python ML libraries or Hub clients. Both Rust and Python test workflows run in GitHub Actions.
 
 ## Quick start
 
