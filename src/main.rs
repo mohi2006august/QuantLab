@@ -523,10 +523,24 @@ fn evaluate_command(
         bail!("Provide --text-file, --prompt-suite, --tasks, or a combination.");
     }
     let gguf = model.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
-    if gguf && tasks.is_none() && judge_model.is_none() {
-        return evaluate_gguf(model, text_file, prompt_suite, max_new_tokens, max_length, output_path);
-    }
     let mut result = json!({});
+    if gguf {
+        result = evaluate_gguf(model, text_file, if judge_model.is_none() { prompt_suite } else { None }, max_new_tokens, max_length)?;
+        if let (Some(suite), Some(judge)) = (prompt_suite, judge_model) {
+            result["custom"] = call_python_adapter("prompt_suite", &[
+                model.as_os_str().to_owned(), suite.as_os_str().to_owned(), max_new_tokens.to_string().into(), judge.into(),
+            ])?;
+        }
+        if let Some(task_list) = tasks {
+            result["tasks"] = call_python_adapter("tasks", &[
+                model.as_os_str().to_owned(), task_list.into(), limit.map(|value| value.to_string()).unwrap_or_default().into(), seed.to_string().into(),
+            ])?;
+        }
+        let rendered = serde_json::to_string_pretty(&result)?;
+        println!("{rendered}");
+        if let Some(path) = output_path { fs::write(path, format!("{rendered}\n"))?; }
+        return Ok(());
+    }
     if let Some(corpus) = text_file {
         result["perplexity"] = call_python_adapter("perplexity", &[
             model.as_os_str().to_owned(), corpus.as_os_str().to_owned(), stride.to_string().into(),
@@ -556,8 +570,7 @@ fn evaluate_gguf(
     prompt_suite: Option<&std::path::Path>,
     max_new_tokens: usize,
     max_length: Option<usize>,
-    output_path: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<Value> {
     if text_file.is_none() && prompt_suite.is_none() {
         bail!("Provide --text-file, --prompt-suite, or both.");
     }
@@ -611,10 +624,7 @@ fn evaluate_gguf(
             "results": outputs,
         });
     }
-    let rendered = serde_json::to_string_pretty(&results)?;
-    println!("{rendered}");
-    if let Some(path) = output_path { fs::write(path, format!("{rendered}\n"))?; }
-    Ok(())
+    Ok(results)
 }
 
 fn parse_perplexity(output: &str) -> Option<f64> {
@@ -999,7 +1009,11 @@ fn run_matrix(
                 else { Some(call_python_adapter("perplexity", &[artifact.clone().into_os_string(), path.as_os_str().to_owned(), "512".into(), "".into()])?["perplexity"].as_f64().context("Perplexity adapter omitted score")?) }
             } else { None };
             let prompt_result = if let Some(suite) = prompt_suite {
-                Some(call_python_adapter("prompt_suite", &[artifact.clone().into_os_string(), suite.as_os_str().to_owned(), "128".into(), judge_model.unwrap_or_default().into()])?)
+                if method == "gguf" && judge_model.is_none() {
+                    Some(evaluate_gguf(&artifact, None, Some(suite), 128, None)?["custom"].clone())
+                } else {
+                    Some(call_python_adapter("prompt_suite", &[artifact.clone().into_os_string(), suite.as_os_str().to_owned(), "128".into(), judge_model.unwrap_or_default().into()])?)
+                }
             } else { None };
             let task_result = if let Some(task_list) = tasks {
                 Some(call_python_adapter("tasks", &[artifact.clone().into_os_string(), task_list.into(), "".into(), seed.to_string().into()])?)
