@@ -983,7 +983,7 @@ fn run_matrix(
         }
         let artifact_dir = run_dir.join(format!("{method}-{variant}"));
         let _ = fs::create_dir_all(&artifact_dir);
-        store_run_result(&database, &run_id, &method, &variant, "running", None, None, None, None, None, None, None, None, None, None)?;
+        store_run_result(&database, &run_id, &method, &variant, "running", None, None, None, None, None, None, None, None)?;
         let attempt = (|| -> Result<(PathBuf, Option<f64>, Option<f64>, Option<String>, Option<Value>)> {
             let artifact = if method == "gguf" && calibration_file.is_none() {
                 quantize_gguf_native(&resolved_model.as_ref().unwrap().to_string_lossy(), &variant, &artifact_dir)?
@@ -1015,16 +1015,13 @@ fn run_matrix(
         })();
         match attempt {
             Ok((artifact, perplexity, custom_score, task_scores, metrics)) => {
-                let tok_s = metrics.as_ref().and_then(|value| value["tok_s"].as_f64());
-                let tok_s_std = metrics.as_ref().and_then(|value| value["tok_s_std"].as_f64());
-                let prefill = metrics.as_ref().and_then(|value| value["prefill_ms_estimate"].as_f64());
                 let cache_dtype = if benchmark.is_some() { Some(kv_cache_dtype) } else { None };
-                store_run_result(&database, &run_id, &method, &variant, "completed", Some(&artifact), Some(artifact_size(&artifact)? as f64 / 1024_f64.powi(3)), perplexity, custom_score, task_scores.as_deref(), cache_dtype, if metrics.is_some() { Some(batch_size as i64) } else { None }, tok_s, tok_s_std, prefill)?;
+                store_run_result(&database, &run_id, &method, &variant, "completed", Some(&artifact), Some(artifact_size(&artifact)? as f64 / 1024_f64.powi(3)), perplexity, custom_score, task_scores.as_deref(), cache_dtype, if metrics.is_some() { Some(batch_size as i64) } else { None }, metrics.as_ref())?;
                 println!("Completed {method}:{variant} → {}", artifact.display());
             }
             Err(error) => {
                 failures += 1;
-                store_run_result(&database, &run_id, &method, &variant, "failed", None, None, None, None, None, None, None, None, None, None)?;
+                store_run_result(&database, &run_id, &method, &variant, "failed", None, None, None, None, None, None, None, None)?;
                 database.execute("UPDATE results SET error=?1 WHERE run_id=?2 AND method=?3 AND variant=?4", rusqlite::params![format!("{error:#}"), run_id, method, variant])?;
                 eprintln!("Failed {method}:{variant}: {error:#}");
             }
@@ -1063,10 +1060,11 @@ fn store_run_result(
     connection: &Connection, run_id: &str, method: &str, variant: &str, status: &str,
     artifact_path: Option<&std::path::Path>, size_gib: Option<f64>, perplexity: Option<f64>,
     custom_score: Option<f64>, task_scores_json: Option<&str>, kv_cache_dtype: Option<&str>,
-    batch_size: Option<i64>, tok_s: Option<f64>, tok_s_std: Option<f64>, prefill_ms_estimate: Option<f64>,
+    batch_size: Option<i64>, metrics: Option<&Value>,
 ) -> Result<()> {
-    connection.execute("INSERT INTO results (run_id, method, variant, status, artifact_path, size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now')) ON CONFLICT(run_id, method, variant) DO UPDATE SET status=excluded.status, artifact_path=excluded.artifact_path, size_gib=excluded.size_gib, perplexity=excluded.perplexity, custom_score=excluded.custom_score, task_scores_json=excluded.task_scores_json, kv_cache_dtype=excluded.kv_cache_dtype, batch_size=excluded.batch_size, tok_s=excluded.tok_s, tok_s_std=excluded.tok_s_std, prefill_ms_estimate=excluded.prefill_ms_estimate, error=NULL, updated_at=excluded.updated_at",
-        rusqlite::params![run_id, method, variant, status, artifact_path.map(|path| path.to_string_lossy().into_owned()), size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate])?;
+    let metric = |key: &str| metrics.and_then(|value| value[key].as_f64());
+    connection.execute("INSERT INTO results (run_id, method, variant, status, artifact_path, size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_tok_s, prefill_ms_estimate, ttft_ms, ttft_ms_std, peak_mem_gib, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, datetime('now')) ON CONFLICT(run_id, method, variant) DO UPDATE SET status=excluded.status, artifact_path=excluded.artifact_path, size_gib=excluded.size_gib, perplexity=excluded.perplexity, custom_score=excluded.custom_score, task_scores_json=excluded.task_scores_json, kv_cache_dtype=excluded.kv_cache_dtype, batch_size=excluded.batch_size, tok_s=excluded.tok_s, tok_s_std=excluded.tok_s_std, prefill_tok_s=excluded.prefill_tok_s, prefill_ms_estimate=excluded.prefill_ms_estimate, ttft_ms=excluded.ttft_ms, ttft_ms_std=excluded.ttft_ms_std, peak_mem_gib=excluded.peak_mem_gib, error=NULL, updated_at=excluded.updated_at",
+        rusqlite::params![run_id, method, variant, status, artifact_path.map(|path| path.to_string_lossy().into_owned()), size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, metric("tok_s"), metric("tok_s_std"), metric("prefill_tok_s"), metric("prefill_ms_estimate"), metric("ttft_ms"), metric("ttft_ms_std"), metric("peak_mem_gib")])?;
     Ok(())
 }
 
@@ -1139,7 +1137,10 @@ fn llama_bench_one(model: &std::path::Path, repeats: usize, prompt: usize, gener
     let row = records.iter().find(|row| row["n_gen"].as_u64().unwrap_or_default() > 0).context("No generation metrics in llama-bench output")?;
     let mut metrics = json!({"tok_s": row["avg_ts"], "tok_s_std": row["stddev_ts"]});
     if let Some(prefill) = records.iter().find(|row| row["n_prompt"].as_u64().unwrap_or_default() > 0 && row["n_gen"].as_u64().unwrap_or_default() == 0).and_then(|row| row["avg_ts"].as_f64()) {
-        if prefill > 0.0 { metrics["prefill_ms_estimate"] = json!(1000.0 * prompt as f64 / prefill); }
+        if prefill > 0.0 {
+            metrics["prefill_tok_s"] = json!(prefill);
+            metrics["prefill_ms_estimate"] = json!(1000.0 * prompt as f64 / prefill);
+        }
     }
     Ok(metrics)
 }
@@ -1316,5 +1317,29 @@ mod tests {
         let report = fs::read_to_string(directory.path().join("run-1.html")).unwrap();
         assert!(report.contains("run-1"));
         assert!(report.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn stores_all_benchmark_metrics_for_each_method() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_run_schema(&connection).unwrap();
+        connection.execute("INSERT INTO runs VALUES ('run-1', 'model', 'device', '{}', 'now')", []).unwrap();
+        let metrics = json!({
+            "tok_s": 22.0,
+            "tok_s_std": 1.5,
+            "prefill_tok_s": 120.0,
+            "prefill_ms_estimate": 8.0,
+            "ttft_ms": 45.0,
+            "ttft_ms_std": 3.0,
+            "peak_mem_gib": 9.5,
+        });
+        store_run_result(&connection, "run-1", "bnb", "nf4", "completed", None, None, None,
+            None, None, Some("fp8"), Some(2), Some(&metrics)).unwrap();
+        let saved: (String, f64, f64, f64, f64, f64, f64, f64) = connection.query_row(
+            "SELECT method, tok_s, tok_s_std, prefill_tok_s, prefill_ms_estimate, ttft_ms, ttft_ms_std, peak_mem_gib FROM results WHERE run_id='run-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        ).unwrap();
+        assert_eq!(saved, ("bnb".to_owned(), 22.0, 1.5, 120.0, 8.0, 45.0, 3.0, 9.5));
     }
 }
