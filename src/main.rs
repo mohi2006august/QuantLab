@@ -30,6 +30,16 @@ enum Commands {
         output_dir: Option<PathBuf>,
         #[arg(long)]
         eval_text: Option<PathBuf>,
+        #[arg(long)]
+        prompt_suite: Option<PathBuf>,
+        #[arg(long)]
+        judge_model: Option<String>,
+        #[arg(long)]
+        tasks: Option<String>,
+        #[arg(long)]
+        calibration_file: Option<PathBuf>,
+        #[arg(long)]
+        seed: Option<u64>,
         #[arg(long, value_parser = ["llama.cpp", "vllm"])]
         benchmark: Option<String>,
         #[arg(long, default_value = "auto")]
@@ -185,32 +195,32 @@ fn main() {
 fn run() -> Result<()> {
     match Cli::parse().command {
         Some(Commands::Doctor) => doctor(),
-        Some(Commands::Run { config, model, methods, device, output_dir, eval_text, benchmark, kv_cache_dtype, batch_size, prompt_tokens, generation_tokens, repeats, resume }) => {
+        Some(Commands::Run { config, model, methods, device, output_dir, eval_text, prompt_suite, judge_model, tasks, calibration_file, seed, benchmark, kv_cache_dtype, batch_size, prompt_tokens, generation_tokens, repeats, resume }) => {
             let configuration = config.as_deref().map(load_run_config).transpose()?;
             let model = model.or_else(|| config_string(configuration.as_ref(), "model"))
                 .context("Provide --model or set model in the run config")?;
             let methods = methods.or_else(|| config_string(configuration.as_ref(), "methods"))
                 .context("Provide --methods or set methods in the run config")?;
             let configured_benchmark = config_string(configuration.as_ref(), "benchmark");
-            if methods.split(',').any(|item| !item.trim().to_ascii_lowercase().starts_with("gguf:"))
-                || benchmark.as_deref().or(configured_benchmark.as_deref()) == Some("vllm") {
-                let raw_args: Vec<_> = env::args_os().skip(1).collect();
-                return forward_legacy(&raw_args);
-            }
             let output_from_config = config_string(configuration.as_ref(), "output_dir").map(PathBuf::from);
             let output_root = output_dir.or(output_from_config).unwrap_or_else(|| PathBuf::from("quantlab-runs"));
             let device = device.or_else(|| config_string(configuration.as_ref(), "device")).unwrap_or_else(|| "unknown".to_owned());
             let eval_text = eval_text.or_else(|| config_string(configuration.as_ref(), "eval_text").map(PathBuf::from));
+            let prompt_suite = prompt_suite.or_else(|| config_string(configuration.as_ref(), "prompt_suite").map(PathBuf::from));
+            let judge_model = judge_model.or_else(|| config_string(configuration.as_ref(), "judge_model"));
+            let tasks = tasks.or_else(|| config_string(configuration.as_ref(), "tasks"));
+            let calibration_file = calibration_file.or_else(|| config_string(configuration.as_ref(), "calibration_file").map(PathBuf::from));
+            let seed = seed.or_else(|| config_usize(configuration.as_ref(), "seed").map(|value| value as u64)).unwrap_or(1234);
             let benchmark = benchmark.or(configured_benchmark);
             let kv_cache_dtype = if kv_cache_dtype == "auto" { config_string(configuration.as_ref(), "kv_cache_dtype").unwrap_or(kv_cache_dtype) } else { kv_cache_dtype };
             let batch_size = batch_size.or_else(|| config_usize(configuration.as_ref(), "batch_size")).unwrap_or(if benchmark.as_deref() == Some("llama.cpp") { 2048 } else { 1 });
             let prompt_tokens = if prompt_tokens == 512 { config_usize(configuration.as_ref(), "prompt_tokens").unwrap_or(prompt_tokens) } else { prompt_tokens };
             let generation_tokens = if generation_tokens == 128 { config_usize(configuration.as_ref(), "generation_tokens").unwrap_or(generation_tokens) } else { generation_tokens };
             let repeats = if repeats == 3 { config_usize(configuration.as_ref(), "repeats").unwrap_or(repeats) } else { repeats };
-            run_gguf_matrix(
+            run_matrix(
                 &model, &methods, &device, &output_root,
-                eval_text.as_deref(), benchmark.as_deref(), &kv_cache_dtype,
-                batch_size, prompt_tokens, generation_tokens, repeats, resume.as_deref(),
+                eval_text.as_deref(), prompt_suite.as_deref(), judge_model.as_deref(), tasks.as_deref(), calibration_file.as_deref(), seed,
+                benchmark.as_deref(), &kv_cache_dtype, batch_size, prompt_tokens, generation_tokens, repeats, resume.as_deref(),
             )
         }
         Some(Commands::Estimate { model, parameters_b, format, device, device_memory_gb, runtime_reserve_gib }) => {
@@ -878,12 +888,17 @@ fn config_usize(configuration: Option<&Value>, key: &str) -> Option<usize> {
     configuration?.get(key)?.as_u64().and_then(|value| usize::try_from(value).ok())
 }
 
-fn run_gguf_matrix(
+fn run_matrix(
     model: &str,
     methods_spec: &str,
     device: &str,
     output_root: &std::path::Path,
     eval_text: Option<&std::path::Path>,
+    prompt_suite: Option<&std::path::Path>,
+    judge_model: Option<&str>,
+    tasks: Option<&str>,
+    calibration_file: Option<&std::path::Path>,
+    seed: u64,
     benchmark: Option<&str>,
     kv_cache_dtype: &str,
     batch_size: usize,
@@ -892,28 +907,32 @@ fn run_gguf_matrix(
     repeats: usize,
     requested_run_id: Option<&str>,
 ) -> Result<()> {
-    if benchmark == Some("vllm") {
-        bail!("vLLM runs currently require the Python compatibility backend.");
-    }
     if batch_size == 0 || prompt_tokens == 0 || generation_tokens == 0 || repeats == 0 {
         bail!("Batch size, token counts, and repeats must be positive.");
     }
+    if benchmark.is_some_and(|backend| !["llama.cpp", "vllm"].contains(&backend)) {
+        bail!("Benchmark backend must be llama.cpp or vllm.");
+    }
     let methods = methods_spec.split(',').map(|item| {
         let (method, variant) = item.trim().split_once(':').context("Methods must use method:variant syntax")?;
-        if !method.eq_ignore_ascii_case("gguf") || variant.trim().is_empty() {
-            bail!("The native Rust runner currently supports GGUF methods only.");
+        let method = method.trim().to_ascii_lowercase();
+        if variant.trim().is_empty() || !["gguf", "bnb", "gptq", "awq", "fp8"].contains(&method.as_str()) {
+            bail!("Unsupported method entry {item:?}; choose gguf, bnb, gptq, awq, or fp8.");
         }
-        let variant = variant.trim().to_ascii_uppercase();
-        if !["Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"].contains(&variant.as_str()) {
+        let variant = if method == "gguf" || method == "gptq" || method == "awq" { variant.trim().to_ascii_uppercase() } else { variant.trim().to_ascii_lowercase() };
+        if method == "gguf" && !["Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"].contains(&variant.as_str()) {
             bail!("Unsupported GGUF quantization {variant:?}.");
         }
-        Ok(variant)
+        Ok((method, variant))
     }).collect::<Result<Vec<_>>>()?;
     if methods.is_empty() || methods.iter().collect::<std::collections::HashSet<_>>().len() != methods.len() {
         bail!("Specify a non-empty method list without duplicate variants.");
     }
+    if benchmark == Some("llama.cpp") && methods.iter().any(|(method, _)| method != "gguf") {
+        bail!("The llama.cpp benchmark backend only supports GGUF artifacts; select vllm for other quantization methods.");
+    }
     fs::create_dir_all(output_root)?;
-    let resolved_model = resolve_model_path(model, output_root)?;
+    let resolved_model = if methods.iter().any(|(method, _)| method == "gguf") { Some(resolve_model_path(model, output_root)?) } else { None };
     let run_id = requested_run_id.map(str::to_owned).unwrap_or_else(|| {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         format!("run-{nanos:x}")
@@ -926,7 +945,7 @@ fn run_gguf_matrix(
     let config = json!({
         "model": model,
         "device": device,
-        "methods": methods.iter().map(|variant| json!(["gguf", variant])).collect::<Vec<_>>(),
+        "methods": methods,
         "eval_text": eval_text.map(|path| path.to_string_lossy()),
         "benchmark_backend": benchmark,
         "kv_cache_dtype": kv_cache_dtype,
@@ -934,11 +953,11 @@ fn run_gguf_matrix(
         "prompt_tokens": prompt_tokens,
         "generation_tokens": generation_tokens,
         "repeats": repeats,
-        "seed": 1234,
-        "judge_model": null,
-        "prompt_suite": null,
-        "tasks": null,
-        "calibration_file": null,
+        "seed": seed,
+        "judge_model": judge_model,
+        "prompt_suite": prompt_suite.map(|path| path.to_string_lossy()),
+        "tasks": tasks,
+        "calibration_file": calibration_file.map(|path| path.to_string_lossy()),
     });
     let existing_config: Option<String> = database.query_row("SELECT config_json FROM runs WHERE run_id=?1", [&run_id], |row| row.get(0)).optional()?;
     if let Some(previous) = existing_config {
@@ -951,42 +970,63 @@ fn run_gguf_matrix(
         database.execute("INSERT INTO runs (run_id, model, device, config_json, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))", rusqlite::params![run_id, model, device, config.to_string()])?;
     }
     let mut failures = 0;
-    for variant in methods {
+    for (method, variant) in methods {
         let existing: Option<(String, Option<String>)> = database.query_row(
-            "SELECT status, artifact_path FROM results WHERE run_id=?1 AND method='gguf' AND variant=?2",
-            rusqlite::params![run_id, variant], |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT status, artifact_path FROM results WHERE run_id=?1 AND method=?2 AND variant=?3",
+            rusqlite::params![run_id, method, variant], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         if let Some((status, Some(artifact))) = &existing {
             if status == "completed" && PathBuf::from(artifact).exists() {
-                println!("Skip gguf:{variant} (already complete)");
+                println!("Skip {method}:{variant} (already complete)");
                 continue;
             }
         }
-        let artifact_dir = run_dir.join(format!("gguf-{variant}"));
+        let artifact_dir = run_dir.join(format!("{method}-{variant}"));
         let _ = fs::create_dir_all(&artifact_dir);
-        store_run_result(&database, &run_id, &variant, "running", None, None, None, None, None, None, None, None, None, None)?;
-        let attempt = (|| -> Result<(PathBuf, Option<f64>, Option<Value>)> {
-            let artifact = quantize_gguf_native(&resolved_model.to_string_lossy(), &variant, &artifact_dir)?;
-            let perplexity = eval_text.map(|path| perplexity_gguf(&artifact, path)).transpose()?;
-            let metrics = if benchmark == Some("llama.cpp") {
-                Some(llama_bench_one(&artifact, repeats, prompt_tokens, generation_tokens, kv_cache_dtype, batch_size)?)
+        store_run_result(&database, &run_id, &method, &variant, "running", None, None, None, None, None, None, None, None, None, None)?;
+        let attempt = (|| -> Result<(PathBuf, Option<f64>, Option<f64>, Option<String>, Option<Value>)> {
+            let artifact = if method == "gguf" && calibration_file.is_none() {
+                quantize_gguf_native(&resolved_model.as_ref().unwrap().to_string_lossy(), &variant, &artifact_dir)?
+            } else {
+                let quantized = call_python_adapter("quantize", &[
+                    model.into(), method.clone().into(), variant.clone().into(), artifact_dir.clone().into_os_string(),
+                    calibration_file.map(|path| path.as_os_str().to_owned()).unwrap_or_default(),
+                ])?;
+                PathBuf::from(quantized["artifact_path"].as_str().context("Quantizer adapter omitted artifact_path")?)
+            };
+            let perplexity = if let Some(path) = eval_text {
+                if method == "gguf" { Some(perplexity_gguf(&artifact, path)?) }
+                else { Some(call_python_adapter("perplexity", &[artifact.clone().into_os_string(), path.as_os_str().to_owned(), "512".into(), "".into()])?["perplexity"].as_f64().context("Perplexity adapter omitted score")?) }
             } else { None };
-            Ok((artifact, perplexity, metrics))
+            let prompt_result = if let Some(suite) = prompt_suite {
+                Some(call_python_adapter("prompt_suite", &[artifact.clone().into_os_string(), suite.as_os_str().to_owned(), "128".into(), judge_model.unwrap_or_default().into()])?)
+            } else { None };
+            let task_result = if let Some(task_list) = tasks {
+                Some(call_python_adapter("tasks", &[artifact.clone().into_os_string(), task_list.into(), "".into(), seed.to_string().into()])?)
+            } else { None };
+            let custom_score = prompt_result.as_ref().and_then(|value| value["judge_score"].as_f64().or_else(|| value["exact_match_score"].as_f64()));
+            let task_scores = task_result.as_ref().map(|value| value["results"].to_string());
+            let metrics = if benchmark == Some("llama.cpp") && method == "gguf" {
+                Some(llama_bench_one(&artifact, repeats, prompt_tokens, generation_tokens, kv_cache_dtype, batch_size)?)
+            } else if benchmark == Some("vllm") {
+                Some(call_python_adapter("vllm_benchmark", &[artifact.clone().into_os_string(), repeats.to_string().into(), prompt_tokens.to_string().into(), generation_tokens.to_string().into(), kv_cache_dtype.into(), batch_size.to_string().into()])?)
+            } else { None };
+            Ok((artifact, perplexity, custom_score, task_scores, metrics))
         })();
         match attempt {
-            Ok((artifact, perplexity, metrics)) => {
+            Ok((artifact, perplexity, custom_score, task_scores, metrics)) => {
                 let tok_s = metrics.as_ref().and_then(|value| value["tok_s"].as_f64());
                 let tok_s_std = metrics.as_ref().and_then(|value| value["tok_s_std"].as_f64());
                 let prefill = metrics.as_ref().and_then(|value| value["prefill_ms_estimate"].as_f64());
-                let cache_dtype = if benchmark == Some("llama.cpp") { Some(if kv_cache_dtype == "auto" { "f16" } else { kv_cache_dtype }) } else { None };
-                store_run_result(&database, &run_id, &variant, "completed", Some(&artifact), Some(artifact_size(&artifact)? as f64 / 1024_f64.powi(3)), perplexity, None, None, cache_dtype, if metrics.is_some() { Some(batch_size as i64) } else { None }, tok_s, tok_s_std, prefill)?;
-                println!("Completed gguf:{variant} → {}", artifact.display());
+                let cache_dtype = if benchmark.is_some() { Some(kv_cache_dtype) } else { None };
+                store_run_result(&database, &run_id, &method, &variant, "completed", Some(&artifact), Some(artifact_size(&artifact)? as f64 / 1024_f64.powi(3)), perplexity, custom_score, task_scores.as_deref(), cache_dtype, if metrics.is_some() { Some(batch_size as i64) } else { None }, tok_s, tok_s_std, prefill)?;
+                println!("Completed {method}:{variant} → {}", artifact.display());
             }
             Err(error) => {
                 failures += 1;
-                store_run_result(&database, &run_id, &variant, "failed", None, None, None, None, None, None, None, None, None, None)?;
-                database.execute("UPDATE results SET error=?1 WHERE run_id=?2 AND method='gguf' AND variant=?3", rusqlite::params![format!("{error:#}"), run_id, variant])?;
-                eprintln!("Failed gguf:{variant}: {error:#}");
+                store_run_result(&database, &run_id, &method, &variant, "failed", None, None, None, None, None, None, None, None, None, None)?;
+                database.execute("UPDATE results SET error=?1 WHERE run_id=?2 AND method=?3 AND variant=?4", rusqlite::params![format!("{error:#}"), run_id, method, variant])?;
+                eprintln!("Failed {method}:{variant}: {error:#}");
             }
         }
     }
@@ -1020,13 +1060,13 @@ fn create_run_schema(connection: &Connection) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn store_run_result(
-    connection: &Connection, run_id: &str, variant: &str, status: &str,
+    connection: &Connection, run_id: &str, method: &str, variant: &str, status: &str,
     artifact_path: Option<&std::path::Path>, size_gib: Option<f64>, perplexity: Option<f64>,
     custom_score: Option<f64>, task_scores_json: Option<&str>, kv_cache_dtype: Option<&str>,
     batch_size: Option<i64>, tok_s: Option<f64>, tok_s_std: Option<f64>, prefill_ms_estimate: Option<f64>,
 ) -> Result<()> {
-    connection.execute("INSERT INTO results (run_id, method, variant, status, artifact_path, size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate, updated_at) VALUES (?1, 'gguf', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now')) ON CONFLICT(run_id, method, variant) DO UPDATE SET status=excluded.status, artifact_path=excluded.artifact_path, size_gib=excluded.size_gib, perplexity=excluded.perplexity, custom_score=excluded.custom_score, task_scores_json=excluded.task_scores_json, kv_cache_dtype=excluded.kv_cache_dtype, batch_size=excluded.batch_size, tok_s=excluded.tok_s, tok_s_std=excluded.tok_s_std, prefill_ms_estimate=excluded.prefill_ms_estimate, error=NULL, updated_at=excluded.updated_at",
-        rusqlite::params![run_id, variant, status, artifact_path.map(|path| path.to_string_lossy().into_owned()), size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate])?;
+    connection.execute("INSERT INTO results (run_id, method, variant, status, artifact_path, size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now')) ON CONFLICT(run_id, method, variant) DO UPDATE SET status=excluded.status, artifact_path=excluded.artifact_path, size_gib=excluded.size_gib, perplexity=excluded.perplexity, custom_score=excluded.custom_score, task_scores_json=excluded.task_scores_json, kv_cache_dtype=excluded.kv_cache_dtype, batch_size=excluded.batch_size, tok_s=excluded.tok_s, tok_s_std=excluded.tok_s_std, prefill_ms_estimate=excluded.prefill_ms_estimate, error=NULL, updated_at=excluded.updated_at",
+        rusqlite::params![run_id, method, variant, status, artifact_path.map(|path| path.to_string_lossy().into_owned()), size_gib, perplexity, custom_score, task_scores_json, kv_cache_dtype, batch_size, tok_s, tok_s_std, prefill_ms_estimate])?;
     Ok(())
 }
 
@@ -1102,16 +1142,6 @@ fn llama_bench_one(model: &std::path::Path, repeats: usize, prompt: usize, gener
         if prefill > 0.0 { metrics["prefill_ms_estimate"] = json!(1000.0 * prompt as f64 / prefill); }
     }
     Ok(metrics)
-}
-
-fn forward_legacy(args: &[std::ffi::OsString]) -> Result<()> {
-    let python = env::var_os("PYTHON").unwrap_or_else(|| "python".into());
-    let status = Command::new(python).arg("-m").arg("quantlab").args(args)
-        .status().context("Could not start the Python compatibility backend; install the QuantLab Python package or set PYTHON")?;
-    if !status.success() {
-        process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
 }
 
 fn call_python_adapter(operation: &str, arguments: &[std::ffi::OsString]) -> Result<Value> {
