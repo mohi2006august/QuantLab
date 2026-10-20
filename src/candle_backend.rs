@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::llama::{Cache, Llama, LlamaConfig};
-use candle_transformers::models::{mistral, qwen2};
+use candle_transformers::models::{gemma, gemma2, mistral, qwen2};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub fn supports_local_model(path: &Path) -> bool {
     }
     let config = fs::read(config_path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     config.as_ref().and_then(|value| value["model_type"].as_str())
-        .is_some_and(|model_type| matches!(model_type, "llama" | "mistral" | "qwen2"))
+        .is_some_and(|model_type| matches!(model_type, "llama" | "mistral" | "qwen2" | "gemma" | "gemma2"))
         && collect_safetensors(path).is_ok_and(|files| !files.is_empty())
 }
 
@@ -180,12 +180,14 @@ enum DecoderModel {
     Llama(Llama, candle_transformers::models::llama::Config),
     Mistral(mistral::Model),
     Qwen2(qwen2::ModelForCausalLM),
+    Gemma(gemma::Model),
+    Gemma2(gemma2::Model),
 }
 
 impl CandleLlama {
     fn load(path: &Path) -> Result<Self> {
         if !supports_local_model(path) {
-            bail!("Candle supports local Llama, Mistral, and Qwen2 models with config.json, tokenizer.json, and safetensors weights.");
+            bail!("Candle supports local Llama, Mistral, Qwen2, Gemma, and Gemma 2 models with config.json, tokenizer.json, and safetensors weights.");
         }
         let config_bytes = fs::read(path.join("config.json"))?;
         let config_json: Value = serde_json::from_slice(&config_bytes).context("Invalid model config.json")?;
@@ -220,6 +222,16 @@ impl CandleLlama {
                 let config: qwen2::Config = serde_json::from_value(config_json).context("Unsupported or invalid Qwen2 config.json")?;
                 let max_position_embeddings = config.max_position_embeddings;
                 (DecoderModel::Qwen2(qwen2::ModelForCausalLM::new(&config, var_builder)?), max_position_embeddings, "qwen2")
+            }
+            "gemma" => {
+                let config: gemma::Config = serde_json::from_value(config_json).context("Unsupported or invalid Gemma config.json")?;
+                let max_position_embeddings = config.max_position_embeddings;
+                (DecoderModel::Gemma(gemma::Model::new(false, &config, var_builder)?), max_position_embeddings, "gemma")
+            }
+            "gemma2" => {
+                let config: gemma2::Config = serde_json::from_value(config_json).context("Unsupported or invalid Gemma 2 config.json")?;
+                let max_position_embeddings = config.max_position_embeddings;
+                (DecoderModel::Gemma2(gemma2::Model::new(false, &config, var_builder)?), max_position_embeddings, "gemma2")
             }
             _ => bail!("Unsupported Candle architecture {architecture:?}"),
         };
@@ -264,6 +276,8 @@ impl CandleLlama {
             DecoderModel::Llama(_, _) => {}
             DecoderModel::Mistral(model) => model.clear_kv_cache(),
             DecoderModel::Qwen2(model) => model.clear_kv_cache(),
+            DecoderModel::Gemma(model) => model.clear_kv_cache(),
+            DecoderModel::Gemma2(model) => model.clear_kv_cache(),
         }
     }
 
@@ -277,6 +291,8 @@ impl CandleLlama {
             }
             DecoderModel::Mistral(model) => model.forward(input, offset)?,
             DecoderModel::Qwen2(model) => model.forward(input, offset)?,
+            DecoderModel::Gemma(model) => model.forward(input, offset)?,
+            DecoderModel::Gemma2(model) => model.forward(input, offset)?,
         };
         match logits.dims().len() {
             3 => Ok(logits.squeeze(0)?.squeeze(0)?),
@@ -334,7 +350,7 @@ mod tests {
         assert!(!supports_local_model(directory.path()));
         fs::write(directory.path().join("tokenizer.json"), "{}").unwrap();
         fs::write(directory.path().join("model.safetensors"), []).unwrap();
-        for model_type in ["llama", "mistral", "qwen2"] {
+        for model_type in ["llama", "mistral", "qwen2", "gemma", "gemma2"] {
             fs::write(directory.path().join("config.json"), format!(r#"{{"model_type":"{model_type}"}}"#)).unwrap();
             assert!(supports_local_model(directory.path()));
         }
