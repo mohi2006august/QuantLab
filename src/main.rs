@@ -183,24 +183,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let raw_args: Vec<_> = env::args_os().skip(1).collect();
-    if let Some(first) = raw_args.first().and_then(|value| value.to_str()) {
-        if first == "sensitivity" && raw_args.iter().any(|argument| argument == "--calibration-file") {
-            return forward_legacy(&raw_args);
-        }
-        if first == "run" && ["--prompt-suite", "--judge-model", "--tasks", "--calibration-file", "--seed"]
-            .iter().any(|flag| raw_args.iter().any(|argument| argument == flag)) {
-            return forward_legacy(&raw_args);
-        }
-    }
     match Cli::parse().command {
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Run { config, model, methods, device, output_dir, eval_text, benchmark, kv_cache_dtype, batch_size, prompt_tokens, generation_tokens, repeats, resume }) => {
             let configuration = config.as_deref().map(load_run_config).transpose()?;
-            if configuration.as_ref().is_some_and(|value| ["prompt_suite", "judge_model", "tasks", "calibration_file"].iter().any(|key| !value[*key].is_null())) {
-                let raw_args: Vec<_> = env::args_os().skip(1).collect();
-                return forward_legacy(&raw_args);
-            }
             let model = model.or_else(|| config_string(configuration.as_ref(), "model"))
                 .context("Provide --model or set model in the run config")?;
             let methods = methods.or_else(|| config_string(configuration.as_ref(), "methods"))
@@ -277,20 +263,19 @@ fn run() -> Result<()> {
             report_command(&run_id, &output_dir, output.as_deref())
         }
         Some(Commands::Evaluate { model_path, text_file, prompt_suite, max_new_tokens, stride, max_length, tasks, limit, seed, judge_model, output }) => {
-            if tasks.is_some() || limit.is_some() || judge_model.is_some() || !is_gguf(&model_path) {
-                let raw_args: Vec<_> = env::args_os().skip(1).collect();
-                return forward_legacy(&raw_args);
-            }
-            let _ = (stride, seed);
-            evaluate_gguf(&model_path, text_file.as_deref(), prompt_suite.as_deref(), max_new_tokens, max_length, output.as_deref())
+            evaluate_command(&model_path, text_file.as_deref(), prompt_suite.as_deref(), max_new_tokens, stride, max_length, tasks.as_deref(), limit, seed, judge_model.as_deref(), output.as_deref())
         }
         Some(Commands::Publish { model_path, repo_id, license, private }) => {
             publish_with_hf_cli(&model_path, &repo_id, &license, private)
         }
         Some(Commands::Sensitivity { model_path, bits, group_size, calibration_file, output }) => {
-            if calibration_file.is_some() {
-                let raw_args: Vec<_> = env::args_os().skip(1).collect();
-                return forward_legacy(&raw_args);
+            if let Some(calibration) = calibration_file {
+                let result = call_python_adapter("sensitivity", &[
+                    model_path.into_os_string(), bits.into(), group_size.to_string().into(),
+                    calibration.into_os_string(), output.clone().into_os_string(),
+                ])?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
             }
             sensitivity_safetensors(&model_path, &bits, group_size, &output)
         }
@@ -325,8 +310,29 @@ fn benchmark_command(
     output: Option<&std::path::Path>,
 ) -> Result<()> {
     if backend == "vllm" {
-        let raw_args: Vec<_> = env::args_os().skip(1).collect();
-        return forward_legacy(&raw_args);
+        let batches = parse_usize_list(batch_sizes, batch_size.unwrap_or(1))?;
+        let prompts = parse_usize_list(prompt_token_sizes, prompt_tokens)?;
+        let generations = parse_usize_list(generation_token_sizes, generation_tokens)?;
+        let dtypes = parse_string_list(kv_cache_dtypes, kv_cache_dtype)?;
+        let mut measurements = Vec::new();
+        for batch in batches {
+            for prompt in &prompts {
+                for generation in &generations {
+                    for dtype in &dtypes {
+                        let result = call_python_adapter("vllm_benchmark", &[
+                            model_path.into(), repeats.to_string().into(), prompt.to_string().into(),
+                            generation.to_string().into(), dtype.clone().into(), batch.to_string().into(),
+                        ])?;
+                        measurements.push(json!({"batch_size": batch, "prompt_tokens": prompt,
+                            "generation_tokens": generation, "kv_cache_dtype": dtype, "metrics": result}));
+                    }
+                }
+            }
+        }
+        let rendered = serde_json::to_string_pretty(&json!({"backend": "vllm", "measurements": measurements}))?;
+        println!("{rendered}");
+        if let Some(path) = output { fs::write(path, format!("{rendered}\n"))?; }
+        return Ok(());
     }
     if repeats == 0 {
         bail!("Benchmark repeats must be at least one.");
@@ -498,8 +504,40 @@ fn find_executable(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn is_gguf(path: &std::path::Path) -> bool {
-    path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+fn evaluate_command(
+    model: &std::path::Path, text_file: Option<&std::path::Path>, prompt_suite: Option<&std::path::Path>,
+    max_new_tokens: usize, stride: usize, max_length: Option<usize>, tasks: Option<&str>, limit: Option<usize>,
+    seed: u64, judge_model: Option<&str>, output_path: Option<&std::path::Path>,
+) -> Result<()> {
+    if text_file.is_none() && prompt_suite.is_none() && tasks.is_none() {
+        bail!("Provide --text-file, --prompt-suite, --tasks, or a combination.");
+    }
+    let gguf = model.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+    if gguf && tasks.is_none() && judge_model.is_none() {
+        return evaluate_gguf(model, text_file, prompt_suite, max_new_tokens, max_length, output_path);
+    }
+    let mut result = json!({});
+    if let Some(corpus) = text_file {
+        result["perplexity"] = call_python_adapter("perplexity", &[
+            model.as_os_str().to_owned(), corpus.as_os_str().to_owned(), stride.to_string().into(),
+            max_length.map(|value| value.to_string()).unwrap_or_default().into(),
+        ])?;
+    }
+    if let Some(suite) = prompt_suite {
+        result["custom"] = call_python_adapter("prompt_suite", &[
+            model.as_os_str().to_owned(), suite.as_os_str().to_owned(), max_new_tokens.to_string().into(),
+            judge_model.unwrap_or_default().into(),
+        ])?;
+    }
+    if let Some(task_list) = tasks {
+        result["tasks"] = call_python_adapter("tasks", &[
+            model.as_os_str().to_owned(), task_list.into(), limit.map(|value| value.to_string()).unwrap_or_default().into(), seed.to_string().into(),
+        ])?;
+    }
+    let rendered = serde_json::to_string_pretty(&result)?;
+    println!("{rendered}");
+    if let Some(path) = output_path { fs::write(path, format!("{rendered}\n"))?; }
+    Ok(())
 }
 
 fn evaluate_gguf(
@@ -1074,6 +1112,45 @@ fn forward_legacy(args: &[std::ffi::OsString]) -> Result<()> {
         process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+fn call_python_adapter(operation: &str, arguments: &[std::ffi::OsString]) -> Result<Value> {
+    const ADAPTER: &str = r#"
+import json, sys
+op, *a = sys.argv[1:]
+if op == 'quantize':
+    from quantlab.runner import quantize_model
+    value = {'artifact_path': str(quantize_model(a[0], a[1], a[2], a[3], a[4] or None))}
+elif op == 'perplexity':
+    from quantlab.evaluate import evaluate_perplexity
+    value = evaluate_perplexity(a[0], a[1], int(a[2]), int(a[3]) if a[3] else None)
+elif op == 'prompt_suite':
+    from quantlab.evaluate import evaluate_prompt_suite
+    value = evaluate_prompt_suite(a[0], a[1], int(a[2]), a[3] or None)
+elif op == 'tasks':
+    from quantlab.evaluate import evaluate_tasks
+    value = evaluate_tasks(a[0], [x for x in a[1].split(',') if x], int(a[2]) if a[2] else None, int(a[3]))
+elif op == 'vllm_benchmark':
+    from quantlab.benchmark import benchmark_vllm
+    value = benchmark_vllm(a[0], int(a[1]), int(a[2]), int(a[3]), a[4], int(a[5]))
+elif op == 'sensitivity':
+    from quantlab.sensitivity import analyze_sensitivity, write_sensitivity_report
+    value = analyze_sensitivity(a[0], tuple(int(x) for x in a[1].split(',') if x), int(a[2]), a[3])
+    write_sensitivity_report(value, a[4])
+else:
+    raise ValueError('Unknown QuantLab Python ML adapter: ' + op)
+print('QL_ADAPTER_RESULT=' + json.dumps(value, default=str))
+"#;
+    let python = env::var_os("PYTHON").unwrap_or_else(|| "python".into());
+    let output = Command::new(python).arg("-c").arg(ADAPTER).arg(operation).args(arguments).output()
+        .context("Could not start the optional Python ML adapter; set PYTHON or install the QuantLab compatibility package")?;
+    if !output.status.success() {
+        bail!("Python ML adapter {operation:?} failed: {}{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result = stdout.lines().rev().find_map(|line| line.strip_prefix("QL_ADAPTER_RESULT="))
+        .context("Python ML adapter did not return a result")?;
+    serde_json::from_str(result).context("Python ML adapter returned invalid JSON")
 }
 
 fn parameter_count(model: Option<&str>, explicit: Option<f64>) -> Result<f64> {
