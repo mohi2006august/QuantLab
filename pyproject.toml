@@ -21,6 +21,7 @@ vllm = ["vllm", "psutil>=5.9"]
 lm-eval = ["lm-eval"]
 hub = ["huggingface_hub"]
 config = ["PyYAML>=6"]
+test = ["pytest>=8"]
 all = ["torch>=2.2", "transformers>=4.45", "bitsandbytes>=0.43", "gptqmodel", "autoawq", "llmcompressor", "datasets", "vllm", "lm-eval", "huggingface_hub", "PyYAML>=6"]
 
 [project.scripts]

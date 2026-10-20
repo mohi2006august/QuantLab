@@ -42,6 +42,7 @@ Each matrix run records states and metrics in `quantlab-runs/results.sqlite` and
 
 ## Optional dependencies
 
+- `pip install -e ".[test]"` and `python -m pytest`: run the unit test suite. GitHub Actions runs it on Python 3.10, 3.11, and 3.12 for pushes and pull requests.
 - `pip install -e ".[gpu]"`: PyTorch, Transformers, and bitsandbytes.
 - `pip install -e ".[gptq]"`, `.[awq]`, or `.[fp8]`: quantization backends.
 - `pip install -e ".[eval]"`, `.[lm-eval]`, or `.[vllm]`: model evaluation and serving benchmarks.
