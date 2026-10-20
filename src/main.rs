@@ -1063,13 +1063,18 @@ fn run_matrix(
                 ])?;
                 PathBuf::from(quantized["artifact_path"].as_str().context("Quantizer adapter omitted artifact_path")?)
             };
+            let candle_model = candle_backend::supports_local_model(&artifact);
             let perplexity = if let Some(path) = eval_text {
                 if method == "gguf" { Some(perplexity_gguf(&artifact, path)?) }
+                else if candle_model { Some(candle_backend::evaluate_perplexity(&artifact, path, 512, None)?["perplexity"].as_f64().context("Candle evaluator omitted perplexity")?) }
                 else { Some(call_python_adapter("perplexity", &[artifact.clone().into_os_string(), path.as_os_str().to_owned(), "512".into(), "".into()])?["perplexity"].as_f64().context("Perplexity adapter omitted score")?) }
             } else { None };
             let prompt_result = if let Some(suite) = prompt_suite {
                 if method == "gguf" && judge_model.is_none() {
                     Some(evaluate_gguf(&artifact, None, Some(suite), 128, None)?["custom"].clone())
+                } else if candle_model && judge_model.is_none_or(|judge| candle_backend::supports_local_model(std::path::Path::new(judge))) {
+                    let prompts: Value = serde_json::from_slice(&fs::read(suite).context("Could not read prompt suite")?)?;
+                    Some(candle_backend::evaluate_prompt_suite(&artifact, &prompts, 128, judge_model.map(std::path::Path::new))?)
                 } else {
                     Some(call_python_adapter("prompt_suite", &[artifact.clone().into_os_string(), suite.as_os_str().to_owned(), "128".into(), judge_model.unwrap_or_default().into()])?)
                 }

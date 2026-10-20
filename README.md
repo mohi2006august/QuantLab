@@ -27,7 +27,7 @@ Built-in device profiles are stored in `devices/`. Use `--device-memory-gb` to e
 
 ## Quantization matrix
 
-The Rust `run` command accepts local Hugging Face model folders, GGUF files, or Hub model IDs (downloaded with the `hf` CLI), and owns the full method matrix and evaluation/benchmark stages. GGUF quantization uses llama.cpp; BnB, GPTQ, AWQ, and FP8 quantization invoke only their corresponding Python library operation. GPTQ and AWQ require a calibration file containing representative text. Rust run configs support flat YAML mappings with scalar values and simple lists, plus JSON.
+The Rust `run` command accepts local Hugging Face model folders, GGUF files, or Hub model IDs (downloaded with the `hf` CLI), and owns the full method matrix and evaluation/benchmark stages. GGUF quantization uses llama.cpp; BnB, GPTQ, AWQ, and FP8 quantization invoke only their corresponding Python library operation. Matrix evaluation uses Candle for compatible local Llama safetensors artifacts, llama.cpp for GGUF, and Python adapters for other model formats or lm-eval tasks. GPTQ and AWQ require a calibration file containing representative text. Rust run configs support flat YAML mappings with scalar values and simple lists, plus JSON.
 
 ```powershell
 quantlab run --model .\models\my-model --methods gguf:Q4_K_M,gguf:Q5_K_M --device rtx4090 --eval-text .\data\wiki.test.raw --benchmark llama.cpp --kv-cache-dtype q8_0 --batch-size 2048 --prompt-tokens 512 --generation-tokens 128
