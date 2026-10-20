@@ -16,7 +16,7 @@ from quantlab.estimator import estimate_memory, parse_parameter_count
 from quantlab.formats import FORMATS, get_format
 from quantlab.recommend import recommend_formats
 from quantlab.orchestrate import parse_methods, run_matrix
-from quantlab.benchmark import benchmark_gguf, benchmark_vllm
+from quantlab.benchmark import benchmark_gguf, benchmark_sweep, benchmark_vllm
 from quantlab.evaluate import evaluate_perplexity, evaluate_prompt_suite, evaluate_tasks
 from quantlab.publish import publish_model
 from quantlab.report import write_html_report
@@ -115,7 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--prompt-tokens", type=int, default=512)
     benchmark.add_argument("--generation-tokens", type=int, default=128)
     benchmark.add_argument("--batch-size", type=int, help="Concurrent requests (default: 2048 llama.cpp / 1 vLLM)")
-    benchmark.add_argument("--kv-cache-dtype", default="f16", choices=("auto", "f16", "q8_0", "q5_0", "q4_0", "fp8", "fp8_e4m3", "fp8_e5m2"))
+    benchmark.add_argument("--kv-cache-dtype", default="auto", choices=("auto", "f16", "q8_0", "q5_0", "q4_0", "fp8", "fp8_e4m3", "fp8_e5m2"))
+    benchmark.add_argument("--batch-sizes", help="Comma-separated batch-size sweep")
+    benchmark.add_argument("--prompt-token-sizes", help="Comma-separated prompt-length sweep")
+    benchmark.add_argument("--generation-token-sizes", help="Comma-separated generation-length sweep")
+    benchmark.add_argument("--kv-cache-dtypes", help="Comma-separated KV-cache dtype sweep")
     benchmark.add_argument("--output", help="Write benchmark metrics to JSON")
     benchmark.set_defaults(handler=_benchmark)
 
@@ -125,10 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--output")
     report.set_defaults(handler=_report)
 
-    sensitivity = commands.add_parser("sensitivity", help="Rank layers by simulated quantization error")
+    sensitivity = commands.add_parser("sensitivity", help="Rank layer sensitivity, optionally weighted by calibration activations")
     sensitivity.add_argument("--model-path", required=True)
     sensitivity.add_argument("--bits", default="2,3,4,8")
     sensitivity.add_argument("--group-size", type=int, default=128)
+    sensitivity.add_argument("--calibration-file", help="Representative text for activation-weighted analysis")
     sensitivity.add_argument("--output", default="sensitivity.json")
     sensitivity.set_defaults(handler=_sensitivity)
 
@@ -308,6 +313,39 @@ def _evaluate(args: argparse.Namespace) -> int:
 
 
 def _benchmark(args: argparse.Namespace) -> int:
+    plural_dimensions = (args.batch_sizes, args.prompt_token_sizes, args.generation_token_sizes, args.kv_cache_dtypes)
+    if any(value is not None for value in plural_dimensions):
+        def parse_sizes(value: str | None, fallback: int) -> list[int]:
+            if value is None:
+                return [fallback]
+            try:
+                values = [int(item.strip()) for item in value.split(",") if item.strip()]
+            except ValueError as error:
+                raise ValueError("Benchmark sweep sizes must be comma-separated positive integers.") from error
+            if not values or any(item < 1 for item in values):
+                raise ValueError("Benchmark sweep sizes must be comma-separated positive integers.")
+            return values
+
+        def parse_dtypes(value: str | None, fallback: str) -> list[str]:
+            values = [item.strip() for item in value.split(",") if item.strip()] if value is not None else [fallback]
+            if not values:
+                raise ValueError("KV-cache dtype sweep cannot be empty.")
+            return values
+
+        measurements = benchmark_sweep(
+            args.model_path,
+            args.backend,
+            args.repeats,
+            parse_sizes(args.batch_sizes, args.batch_size or (2048 if args.backend == "llama.cpp" else 1)),
+            parse_sizes(args.prompt_token_sizes, args.prompt_tokens),
+            parse_sizes(args.generation_token_sizes, args.generation_tokens),
+            parse_dtypes(args.kv_cache_dtypes, args.kv_cache_dtype),
+        )
+        rendered = json.dumps({"results": measurements}, indent=2)
+        print(rendered)
+        if args.output:
+            Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+        return 0
     if args.batch_size is not None and args.batch_size < 1:
         raise ValueError("Benchmark batch size must be at least one.")
     benchmark_fn = benchmark_gguf if args.backend == "llama.cpp" else benchmark_vllm
@@ -345,7 +383,7 @@ def _report(args: argparse.Namespace) -> int:
 
 def _sensitivity(args: argparse.Namespace) -> int:
     bits = tuple(int(value.strip()) for value in args.bits.split(",") if value.strip())
-    result = analyze_sensitivity(args.model_path, bits, args.group_size)
+    result = analyze_sensitivity(args.model_path, bits, args.group_size, args.calibration_file)
     path = write_sensitivity_report(result, args.output)
     print(f"Sensitivity report: {path} ({len(result['layers'])} layers)")
     return 0

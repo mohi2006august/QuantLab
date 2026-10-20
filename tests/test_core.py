@@ -3,6 +3,7 @@ import json
 import pytest
 
 from quantlab.config import load_run_config
+from quantlab import benchmark
 from quantlab.devices import get_device
 from quantlab.estimator import estimate_memory, parse_parameter_count
 from quantlab.formats import get_format
@@ -47,6 +48,28 @@ def test_method_matrix_validation():
         parse_methods("gguf:Q4_K_M,GGUF:q4_k_m")
     with pytest.raises(ValueError, match="Unsupported"):
         parse_methods("unknown:4")
+
+
+def test_benchmark_sweep_runs_each_parameter_combination(monkeypatch):
+    calls = []
+
+    def fake_benchmark(model_path, **kwargs):
+        calls.append((model_path, kwargs))
+        return {"tok_s": 10.0}
+
+    monkeypatch.setattr(benchmark, "benchmark_gguf", fake_benchmark)
+    results = benchmark.benchmark_sweep(
+        "model.gguf", "llama.cpp", 2, [1, 2], [128], [16, 32], ["auto"]
+    )
+    assert len(calls) == 4
+    assert len(results) == 4
+    assert results[0]["kv_cache_dtype"] == "f16"
+    assert {row["batch_size"] for row in results} == {1, 2}
+
+
+def test_benchmark_sweep_rejects_empty_dimensions():
+    with pytest.raises(ValueError, match="dimension"):
+        benchmark.benchmark_sweep("model.gguf", "llama.cpp", 1, [], [128], [16], ["f16"])
 
 
 def test_run_store_round_trip_and_run_id_validation(tmp_path):

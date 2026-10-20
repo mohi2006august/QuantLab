@@ -1,0 +1,12 @@
+[package]
+name = "quantlab"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Local LLM quantization planning and workflow orchestration"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+

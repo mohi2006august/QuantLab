@@ -1,21 +1,26 @@
 # QuantLab
 
-QuantLab runs reproducible local LLM quantization matrices, measures quality and throughput, and builds Pareto reports with hardware-aware recommendations. GPU operations use optional backends; install only the extras your hardware and workflow need.
+QuantLab runs reproducible local LLM quantization matrices, measures quality and throughput, and builds Pareto reports with hardware-aware recommendations. The Rust CLI is the primary entry point for planning; advanced quantization and evaluation commands currently use the Python compatibility backend because their upstream GPU libraries are Python-based. GPU operations use optional backends; install only the extras your hardware and workflow need.
+
+## Rust CLI
+
+Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. The Rust CLI implements `doctor`, `estimate`, and `recommend` natively. `run`, `evaluate`, `benchmark`, `report`, `sensitivity`, and `publish` currently forward to the Python compatibility package. Both Rust and Python test workflows run in GitHub Actions.
 
 ## Quick start
 
 ```powershell
-python -m pip install -e .
-quantlab doctor
-quantlab recommend --model Qwen2.5-14B --device m3pro18
-quantlab estimate --parameters-b 14 --format Q4_K_M --device-memory-gb 18
-quantlab run --model Qwen/Qwen2.5-0.5B --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
+cargo run --release -- doctor
+cargo run --release -- recommend --model Qwen2.5-14B --device m3pro18
+cargo run --release -- estimate --parameters-b 14 --format Q4_K_M --device-memory-gb 18
+cargo run --release -- run --model Qwen/Qwen2.5-0.5B --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
 ```
+
+Advanced Python-backed commands need the compatibility package installed with `python -m pip install -e .` and the relevant optional dependencies.
 
 You can pass a parameter count directly when it cannot be inferred from the model name:
 
 ```powershell
-quantlab recommend --parameters-b 8 --device rtx4090
+cargo run --release -- recommend --parameters-b 8 --device rtx4090
 ```
 
 Built-in device profiles are stored in `devices/`. Use `--device-memory-gb` to estimate for another device without editing a profile. Override the runtime reserve with `--runtime-reserve-gib`.
@@ -36,7 +41,7 @@ Each matrix run records states and metrics in `quantlab-runs/results.sqlite` and
 
 ## Evaluation and analysis
 
-`evaluate` supports sliding-window perplexity, custom JSON prompt suites, and tasks from lm-evaluation-harness. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. Pass `--judge-model` to run an optional local model judge against expected answers. `benchmark` measures repeated generation throughput with llama.cpp or vLLM and can vary KV cache precision. It samples per-process NVIDIA memory when `nvidia-smi` exposes it; vLLM versions that expose request metrics report TTFT, while llama.cpp reports a prefill-time estimate separately. `sensitivity` ranks linear layers by simulated groupwise quantization error and writes mixed-precision suggestions. These simulated weight errors are not a substitute for activation-aware GPTQ/AWQ calibration.
+`evaluate` supports sliding-window perplexity, custom JSON prompt suites, and tasks from lm-evaluation-harness. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. Pass `--judge-model` to run an optional local model judge against expected answers. `benchmark` measures repeated generation throughput with llama.cpp or vLLM and can vary KV cache precision. Use `--batch-sizes`, `--prompt-token-sizes`, `--generation-token-sizes`, and `--kv-cache-dtypes` for a Cartesian parameter sweep. It samples per-process NVIDIA memory when `nvidia-smi` exposes it; vLLM versions that expose request metrics report TTFT, while llama.cpp reports a prefill-time estimate separately. `sensitivity` ranks linear layers by groupwise quantization error; add `--calibration-file` to use activation-weighted diagonal error estimates from representative calibration text.
 
 `publish` uploads a local artifact folder to Hugging Face Hub using `HF_TOKEN` and requires the source model's license identifier to create a model card. Check the model and dataset licenses before publishing. It is an explicit separate command and is not invoked by `run`.
 

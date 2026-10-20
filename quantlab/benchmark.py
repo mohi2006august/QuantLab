@@ -9,6 +9,50 @@ from pathlib import Path
 from statistics import mean, stdev
 
 
+def benchmark_sweep(
+    model_path: str,
+    backend: str,
+    repeats: int,
+    batch_sizes: list[int],
+    prompt_token_sizes: list[int],
+    generation_token_sizes: list[int],
+    kv_cache_dtypes: list[str],
+) -> list[dict[str, float | int | str]]:
+    if backend not in {"llama.cpp", "vllm"}:
+        raise ValueError("Benchmark backend must be 'llama.cpp' or 'vllm'.")
+    dimensions = (batch_sizes, prompt_token_sizes, generation_token_sizes, kv_cache_dtypes)
+    if any(not values for values in dimensions):
+        raise ValueError("Every benchmark sweep dimension must contain at least one value.")
+    if repeats < 1 or any(value < 1 for values in dimensions[:3] for value in values):
+        raise ValueError("Repeats and benchmark sizes must be at least one.")
+    benchmark = benchmark_gguf if backend == "llama.cpp" else benchmark_vllm
+    results = []
+    for batch_size in batch_sizes:
+        for prompt_tokens in prompt_token_sizes:
+            for generation_tokens in generation_token_sizes:
+                for requested_dtype in kv_cache_dtypes:
+                    cache_dtype = requested_dtype
+                    if backend == "llama.cpp" and cache_dtype == "auto":
+                        cache_dtype = "f16"
+                    metrics = benchmark(
+                        model_path,
+                        repeats=repeats,
+                        prompt_tokens=prompt_tokens,
+                        generation_tokens=generation_tokens,
+                        kv_cache_dtype=cache_dtype,
+                        batch_size=batch_size,
+                    )
+                    results.append({
+                        **metrics,
+                        "backend": backend,
+                        "batch_size": batch_size,
+                        "prompt_tokens": prompt_tokens,
+                        "generation_tokens": generation_tokens,
+                        "kv_cache_dtype": cache_dtype,
+                    })
+    return results
+
+
 def _gpu_memory_gib(process_id: int) -> float | None:
     executable = shutil.which("nvidia-smi")
     if not executable:
