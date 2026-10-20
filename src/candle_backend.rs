@@ -66,14 +66,16 @@ pub fn evaluate_perplexity(path: &Path, text_path: &Path, stride: usize, max_len
     }))
 }
 
-pub fn evaluate_prompt_suite(path: &Path, suite: &Value, max_new_tokens: usize) -> Result<Value> {
+pub fn evaluate_prompt_suite(path: &Path, suite: &Value, max_new_tokens: usize, judge_path: Option<&Path>) -> Result<Value> {
     let items = suite.as_array().context("Prompt suite must be a JSON array")?;
     if items.is_empty() || max_new_tokens == 0 {
         bail!("Prompt suite must not be empty and max_new_tokens must be positive.");
     }
     let mut model = CandleLlama::load(path)?;
+    let mut judge = judge_path.map(CandleLlama::load).transpose()?;
     let mut outputs = Vec::with_capacity(items.len());
     let mut exact_matches = Vec::new();
+    let mut judge_scores = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let prompt = item["prompt"].as_str().context("Each prompt-suite item needs a string 'prompt'")?;
         let completion = model.generate(prompt, max_new_tokens)?;
@@ -82,22 +84,36 @@ pub fn evaluate_prompt_suite(path: &Path, suite: &Value, max_new_tokens: usize) 
         if let Some(matched) = exact_match {
             exact_matches.push(matched);
         }
+        let judge_pass = if let (Some(judge_model), Some(reference)) = (judge.as_mut(), expected) {
+            let judge_prompt = format!(
+                "Decide whether the answer is correct and satisfies the reference. Reply with exactly PASS or FAIL.\nQuestion: {prompt}\nReference: {reference}\nAnswer: {completion}\nDecision:"
+            );
+            let verdict = judge_model.generate(&judge_prompt, 4)?;
+            let passed = judge_verdict(&verdict);
+            judge_scores.push(passed);
+            Some(passed)
+        } else {
+            None
+        };
         outputs.push(json!({
             "id": item.get("id").cloned().unwrap_or_else(|| json!(index.to_string())),
             "completion": completion,
             "exact_match": exact_match,
-            "judge_pass": null,
+            "judge_pass": judge_pass,
         }));
     }
     let exact_match_score = if exact_matches.is_empty() { Value::Null } else {
         json!(exact_matches.iter().filter(|matched| **matched).count() as f64 / exact_matches.len() as f64)
     };
+    let judge_score = if judge_scores.is_empty() { Value::Null } else {
+        json!(judge_scores.iter().filter(|passed| **passed).count() as f64 / judge_scores.len() as f64)
+    };
     Ok(json!({
         "count": outputs.len(),
         "exact_match_score": exact_match_score,
         "scored_count": exact_matches.len(),
-        "judge_score": null,
-        "judge_scored_count": 0,
+        "judge_score": judge_score,
+        "judge_scored_count": judge_scores.len(),
         "results": outputs,
         "runtime": "candle",
         "architecture": "llama",
@@ -191,6 +207,10 @@ fn negative_log_probability(logits: &[f32], target: usize) -> Result<f64> {
     Ok(maximum + normalizer.ln() - value)
 }
 
+fn judge_verdict(verdict: &str) -> bool {
+    verdict.trim().to_ascii_lowercase().starts_with("pass")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +232,13 @@ mod tests {
         fs::write(directory.path().join("tokenizer.json"), "{}").unwrap();
         fs::write(directory.path().join("model.safetensors"), []).unwrap();
         assert!(!supports_local_model(directory.path()));
+    }
+
+    #[test]
+    fn parses_native_judge_verdicts() {
+        assert!(judge_verdict("PASS"));
+        assert!(judge_verdict(" pass: correct"));
+        assert!(!judge_verdict("FAIL"));
+        assert!(!judge_verdict("uncertain"));
     }
 }

@@ -548,13 +548,18 @@ fn evaluate_command(
             result["perplexity"] = candle_backend::evaluate_perplexity(model, corpus, stride, max_length)?;
         }
         if let Some(suite) = prompt_suite {
-            if let Some(judge) = judge_model {
+            if let Some(judge) = judge_model.filter(|judge| !candle_backend::supports_local_model(std::path::Path::new(judge))) {
                 result["custom"] = call_python_adapter("prompt_suite", &[
                     model.as_os_str().to_owned(), suite.as_os_str().to_owned(), max_new_tokens.to_string().into(), judge.into(),
                 ])?;
             } else {
                 let prompts: Value = serde_json::from_slice(&fs::read(suite).context("Could not read prompt suite")?)?;
-                result["custom"] = candle_backend::evaluate_prompt_suite(model, &prompts, max_new_tokens)?;
+                result["custom"] = candle_backend::evaluate_prompt_suite(
+                    model,
+                    &prompts,
+                    max_new_tokens,
+                    judge_model.map(std::path::Path::new),
+                )?;
             }
         }
         if let Some(task_list) = tasks {
