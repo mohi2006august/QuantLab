@@ -138,6 +138,18 @@ enum Commands {
         #[arg(long)]
         private: bool,
     },
+    Sensitivity {
+        #[arg(long)]
+        model_path: PathBuf,
+        #[arg(long, default_value = "2,3,4,8")]
+        bits: String,
+        #[arg(long, default_value_t = 128)]
+        group_size: usize,
+        #[arg(long)]
+        calibration_file: Option<PathBuf>,
+        #[arg(long, default_value = "sensitivity.json")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -173,10 +185,10 @@ fn main() {
 fn run() -> Result<()> {
     let raw_args: Vec<_> = env::args_os().skip(1).collect();
     if let Some(first) = raw_args.first().and_then(|value| value.to_str()) {
-        if first == "sensitivity" {
+        if first == "sensitivity" && raw_args.iter().any(|argument| argument == "--calibration-file") {
             return forward_legacy(&raw_args);
         }
-        if first == "run" && ["--config", "--prompt-suite", "--judge-model", "--tasks", "--calibration-file", "--seed"]
+        if first == "run" && ["--prompt-suite", "--judge-model", "--tasks", "--calibration-file", "--seed"]
             .iter().any(|flag| raw_args.iter().any(|argument| argument == flag)) {
             return forward_legacy(&raw_args);
         }
@@ -184,18 +196,35 @@ fn run() -> Result<()> {
     match Cli::parse().command {
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Run { config, model, methods, device, output_dir, eval_text, benchmark, kv_cache_dtype, batch_size, prompt_tokens, generation_tokens, repeats, resume }) => {
-            if config.is_some() || methods.as_deref().map_or(true, |spec| spec.split(',').any(|item| !item.trim().to_ascii_lowercase().starts_with("gguf:")))
-                || benchmark.as_deref() == Some("vllm") {
+            let configuration = config.as_deref().map(load_run_config).transpose()?;
+            if configuration.as_ref().is_some_and(|value| ["prompt_suite", "judge_model", "tasks", "calibration_file"].iter().any(|key| !value[*key].is_null())) {
                 let raw_args: Vec<_> = env::args_os().skip(1).collect();
                 return forward_legacy(&raw_args);
             }
-            let model = model.context("Provide --model for the native Rust GGUF runner")?;
-            let methods = methods.context("Provide --methods for the native Rust GGUF runner")?;
+            let model = model.or_else(|| config_string(configuration.as_ref(), "model"))
+                .context("Provide --model or set model in the run config")?;
+            let methods = methods.or_else(|| config_string(configuration.as_ref(), "methods"))
+                .context("Provide --methods or set methods in the run config")?;
+            let configured_benchmark = config_string(configuration.as_ref(), "benchmark");
+            if methods.split(',').any(|item| !item.trim().to_ascii_lowercase().starts_with("gguf:"))
+                || benchmark.as_deref().or(configured_benchmark.as_deref()) == Some("vllm") {
+                let raw_args: Vec<_> = env::args_os().skip(1).collect();
+                return forward_legacy(&raw_args);
+            }
+            let output_from_config = config_string(configuration.as_ref(), "output_dir").map(PathBuf::from);
+            let output_root = output_dir.or(output_from_config).unwrap_or_else(|| PathBuf::from("quantlab-runs"));
+            let device = device.or_else(|| config_string(configuration.as_ref(), "device")).unwrap_or_else(|| "unknown".to_owned());
+            let eval_text = eval_text.or_else(|| config_string(configuration.as_ref(), "eval_text").map(PathBuf::from));
+            let benchmark = benchmark.or(configured_benchmark);
+            let kv_cache_dtype = if kv_cache_dtype == "auto" { config_string(configuration.as_ref(), "kv_cache_dtype").unwrap_or(kv_cache_dtype) } else { kv_cache_dtype };
+            let batch_size = batch_size.or_else(|| config_usize(configuration.as_ref(), "batch_size")).unwrap_or(if benchmark.as_deref() == Some("llama.cpp") { 2048 } else { 1 });
+            let prompt_tokens = if prompt_tokens == 512 { config_usize(configuration.as_ref(), "prompt_tokens").unwrap_or(prompt_tokens) } else { prompt_tokens };
+            let generation_tokens = if generation_tokens == 128 { config_usize(configuration.as_ref(), "generation_tokens").unwrap_or(generation_tokens) } else { generation_tokens };
+            let repeats = if repeats == 3 { config_usize(configuration.as_ref(), "repeats").unwrap_or(repeats) } else { repeats };
             run_gguf_matrix(
-                &model, &methods, device.as_deref().unwrap_or("unknown"),
-                output_dir.as_deref().unwrap_or_else(|| std::path::Path::new("quantlab-runs")),
+                &model, &methods, &device, &output_root,
                 eval_text.as_deref(), benchmark.as_deref(), &kv_cache_dtype,
-                batch_size.unwrap_or(2048), prompt_tokens, generation_tokens, repeats, resume.as_deref(),
+                batch_size, prompt_tokens, generation_tokens, repeats, resume.as_deref(),
             )
         }
         Some(Commands::Estimate { model, parameters_b, format, device, device_memory_gb, runtime_reserve_gib }) => {
@@ -258,6 +287,13 @@ fn run() -> Result<()> {
         Some(Commands::Publish { model_path, repo_id, license, private }) => {
             publish_with_hf_cli(&model_path, &repo_id, &license, private)
         }
+        Some(Commands::Sensitivity { model_path, bits, group_size, calibration_file, output }) => {
+            if calibration_file.is_some() {
+                let raw_args: Vec<_> = env::args_os().skip(1).collect();
+                return forward_legacy(&raw_args);
+            }
+            sensitivity_safetensors(&model_path, &bits, group_size, &output)
+        }
         None => Ok(()),
     }
 }
@@ -265,7 +301,7 @@ fn run() -> Result<()> {
 fn doctor() -> Result<()> {
     println!("QuantLab {}", env!("CARGO_PKG_VERSION"));
     println!("Rust toolchain: {}", option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("stable"));
-    for tool in ["llama-cli", "llama-quantize", "llama-perplexity", "llama-bench", "llama-server", "nvidia-smi"] {
+    for tool in ["llama-cli", "llama-quantize", "llama-perplexity", "llama-bench", "llama-server", "nvidia-smi", "hf", "python"] {
         let path = env::split_paths(&env::var_os("PATH").unwrap_or_default())
             .map(|directory| directory.join(if cfg!(windows) { format!("{tool}.exe") } else { tool.to_owned() }))
             .find(|candidate| candidate.is_file());
@@ -588,12 +624,220 @@ fn publish_with_hf_cli(model_path: &std::path::Path, repo_id: &str, license: &st
     Ok(())
 }
 
+fn sensitivity_safetensors(model_path: &std::path::Path, bits: &str, group_size: usize, output: &std::path::Path) -> Result<()> {
+    if group_size == 0 { bail!("Group size must be positive."); }
+    let bits = bits.split(',').map(|item| item.trim().parse::<u8>()).collect::<std::result::Result<Vec<_>, _>>()?;
+    if bits.is_empty() || bits.iter().any(|bit| !(2..=8).contains(bit)) { bail!("Specify bit widths from 2 to 8."); }
+    let mut files = Vec::new();
+    collect_safetensors(model_path, &mut files)?;
+    if files.is_empty() { bail!("No .safetensors files found; this native analysis requires Hugging Face safetensors weights."); }
+    let mut layers = Vec::new();
+    for file in files { analyze_safetensors_file(&file, group_size, &bits, &mut layers)?; }
+    if layers.is_empty() { bail!("No supported two-dimensional floating-point tensors were found."); }
+    layers.sort_by(|left, right| {
+        right["errors"]["4"].as_f64().unwrap_or_default().total_cmp(&left["errors"]["4"].as_f64().unwrap_or_default())
+    });
+    let suggestion_count = std::cmp::max(1, layers.len() / 10);
+    let suggested_bits = *bits.iter().max().context("No precision widths supplied")?;
+    let suggestions = layers.iter().take(suggestion_count).map(|layer| json!({
+        "layer": layer["name"],
+        "recommended_bits": suggested_bits,
+        "reason": "highest simulated groupwise weight quantization error",
+    })).collect::<Vec<_>>();
+    let result = json!({
+        "model": model_path,
+        "group_size": group_size,
+        "method": "weight_only_safetensors_simulation",
+        "layers": layers,
+        "mixed_precision_suggestions": suggestions,
+    });
+    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
+    fs::write(output, serde_json::to_string_pretty(&result)?)?;
+    println!("Sensitivity report: {} ({} layers)", output.display(), result["layers"].as_array().map_or(0, Vec::len));
+    Ok(())
+}
+
+fn collect_safetensors(path: &std::path::Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_file() {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("safetensors") { files.push(path.to_path_buf()); }
+        return Ok(());
+    }
+    for item in fs::read_dir(path).with_context(|| format!("Could not read model directory {}", path.display()))? {
+        let item = item?;
+        if item.file_type()?.is_dir() { collect_safetensors(&item.path(), files)?; }
+        else if item.path().extension().and_then(|ext| ext.to_str()) == Some("safetensors") { files.push(item.path()); }
+    }
+    Ok(())
+}
+
+fn analyze_safetensors_file(path: &std::path::Path, group_size: usize, bits: &[u8], layers: &mut Vec<Value>) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let mut length_bytes = [0; 8];
+    file.read_exact(&mut length_bytes)?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    if header_len > 128 * 1024 * 1024 { bail!("Safetensors header is unexpectedly large in {}", path.display()); }
+    let mut header_bytes = vec![0; header_len as usize];
+    file.read_exact(&mut header_bytes)?;
+    let header: Value = serde_json::from_slice(&header_bytes).context("Invalid safetensors header")?;
+    let data_start = 8 + header_len;
+    let file_len = file.metadata()?.len();
+    for (name, tensor) in header.as_object().context("Safetensors header must be an object")? {
+        if name == "__metadata__" || tensor["shape"].as_array().map_or(true, |shape| shape.len() != 2) { continue; }
+        let dtype = tensor["dtype"].as_str().unwrap_or_default();
+        let element_bytes = match dtype { "F16" | "BF16" => 2usize, "F32" => 4, "F64" => 8, _ => continue };
+        let shape = tensor["shape"].as_array().unwrap();
+        let rows = shape[0].as_u64().context("Invalid tensor row count")?;
+        let columns = shape[1].as_u64().context("Invalid tensor column count")?;
+        if rows == 0 || columns == 0 { continue; }
+        let offsets = tensor["data_offsets"].as_array().context("Tensor missing data_offsets")?;
+        let start = offsets[0].as_u64().context("Invalid tensor offset")?;
+        let end = offsets[1].as_u64().context("Invalid tensor offset")?;
+        let count = rows.checked_mul(columns).context("Tensor element count overflow")?;
+        let byte_count = count.checked_mul(element_bytes as u64).context("Tensor byte count overflow")?;
+        if end < start || end - start != byte_count || data_start.checked_add(end).map_or(true, |position| position > file_len) {
+            bail!("Invalid tensor storage range for {name} in {}", path.display());
+        }
+        let mut totals = bits.iter().map(|bit| (*bit, (0.0f64, 0u64))).collect::<std::collections::HashMap<_, _>>();
+        let mut index = 0u64;
+        while index < count {
+            let take = std::cmp::min(group_size as u64, count - index) as usize;
+            let mut data = vec![0u8; take * element_bytes];
+            file.seek(SeekFrom::Start(data_start + start + index * element_bytes as u64))?;
+            file.read_exact(&mut data)?;
+            let values = decode_tensor_values(&data, dtype)?;
+            let max_abs = values.iter().fold(0.0f32, |maximum, value| maximum.max(value.abs()));
+            for bit in bits {
+                let quant_max = ((1u32 << (*bit - 1)) - 1) as f32;
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / quant_max };
+                let error = values.iter().map(|value| {
+                    let quantized = ((value / scale).round().clamp(-quant_max, quant_max)) * scale;
+                    let delta = *value - quantized;
+                    (delta as f64) * (delta as f64)
+                }).sum::<f64>();
+                let (sum, elements) = totals.get_mut(bit).unwrap();
+                *sum += error;
+                *elements += values.len() as u64;
+            }
+            index += take as u64;
+        }
+        let errors = totals.into_iter().map(|(bit, (sum, count))| (bit.to_string(), json!(sum / count.max(1) as f64))).collect::<serde_json::Map<_, _>>();
+        layers.push(json!({
+            "name": name.strip_suffix(".weight").unwrap_or(name),
+            "shape": shape,
+            "errors": errors,
+            "sensitivity_method": "weight_only",
+            "source_file": path.file_name().map(|value| value.to_string_lossy()),
+        }));
+    }
+    Ok(())
+}
+
+fn decode_tensor_values(data: &[u8], dtype: &str) -> Result<Vec<f32>> {
+    let width = match dtype { "F16" | "BF16" => 2, "F32" => 4, "F64" => 8, _ => bail!("Unsupported floating point type {dtype}") };
+    if data.len() % width != 0 { bail!("Tensor data length is not aligned to its element type."); }
+    Ok(data.chunks_exact(width).map(|chunk| match dtype {
+        "F16" => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+        "BF16" => f32::from_bits((u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16),
+        "F32" => f32::from_le_bytes(chunk.try_into().unwrap()),
+        "F64" => f64::from_le_bytes(chunk.try_into().unwrap()) as f32,
+        _ => unreachable!(),
+    }).collect())
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = ((bits >> 10) & 0x1f) as u32;
+    let fraction = (bits & 0x03ff) as u32;
+    let converted = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let normalized = (fraction as f32) * 2.0f32.powi(-24);
+            return if sign == 0 { normalized } else { -normalized };
+        }
+        31 => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | ((exponent + 112) << 23) | (fraction << 13),
+    };
+    f32::from_bits(converted)
+}
+
 fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty() || run_id.len() > 64 || !run_id.as_bytes()[0].is_ascii_alphanumeric()
         || !run_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) {
         bail!("Run ID must be 1-64 letters, numbers, dots, underscores, or hyphens and start with a letter or number.");
     }
     Ok(())
+}
+
+fn load_run_config(path: &std::path::Path) -> Result<Value> {
+    let source = fs::read_to_string(path).with_context(|| format!("Could not read config {}", path.display()))?;
+    let value = if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
+        serde_json::from_str::<Value>(&source)?
+    } else {
+        parse_simple_yaml(&source)?
+    };
+    let object = value.as_object().context("Run configuration must be an object")?;
+    let keys = ["model", "methods", "device", "output_dir", "eval_text", "prompt_suite", "judge_model", "calibration_file", "tasks", "benchmark", "kv_cache_dtype", "repeats", "seed", "batch_size", "prompt_tokens", "generation_tokens"];
+    if let Some(key) = object.keys().find(|key| !keys.contains(&key.as_str())) {
+        bail!("Unknown configuration key {key:?}.");
+    }
+    Ok(value)
+}
+
+fn parse_simple_yaml(source: &str) -> Result<Value> {
+    let mut values = serde_json::Map::new();
+    let mut active_list: Option<String> = None;
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some(item) = line.strip_prefix("- ") {
+            let key = active_list.as_ref().context("YAML list item is not under a key")?;
+            let list = values.get_mut(key).and_then(Value::as_array_mut).context("Invalid YAML list value")?;
+            list.push(parse_yaml_scalar(item.trim())?);
+            continue;
+        }
+        let (key, value) = line.split_once(':').with_context(|| format!("Invalid YAML config at line {}", line_index + 1))?;
+        let key = key.trim();
+        if key.is_empty() { bail!("Empty YAML key at line {}", line_index + 1); }
+        let value = value.trim();
+        if value.is_empty() {
+            values.insert(key.to_owned(), Value::Array(Vec::new()));
+            active_list = Some(key.to_owned());
+        } else {
+            values.insert(key.to_owned(), parse_yaml_scalar(value)?);
+            active_list = None;
+        }
+    }
+    Ok(Value::Object(values))
+}
+
+fn parse_yaml_scalar(value: &str) -> Result<Value> {
+    if value.starts_with('"') || value.starts_with('[') || value.starts_with('{') {
+        return Ok(serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.trim_matches('"').to_owned())));
+    }
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        return Ok(Value::String(value[1..value.len() - 1].replace("''", "'")));
+    }
+    match value {
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
+        "null" | "~" => Ok(Value::Null),
+        _ => Ok(value.parse::<i64>().map(|number| json!(number))
+            .or_else(|_| value.parse::<f64>().map(|number| json!(number)))
+            .unwrap_or_else(|_| Value::String(value.to_owned()))),
+    }
+}
+
+fn config_string(configuration: Option<&Value>, key: &str) -> Option<String> {
+    match configuration?.get(key)? {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(values) => Some(values.iter().map(|value| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())).collect::<Vec<_>>().join(",")),
+        _ => None,
+    }
+}
+
+fn config_usize(configuration: Option<&Value>, key: &str) -> Option<usize> {
+    configuration?.get(key)?.as_u64().and_then(|value| usize::try_from(value).ok())
 }
 
 fn run_gguf_matrix(
@@ -630,10 +874,8 @@ fn run_gguf_matrix(
     if methods.is_empty() || methods.iter().collect::<std::collections::HashSet<_>>().len() != methods.len() {
         bail!("Specify a non-empty method list without duplicate variants.");
     }
-    if !PathBuf::from(model).is_dir() && !PathBuf::from(model).is_file() {
-        bail!("Rust-native GGUF conversion currently requires a local model directory or GGUF file.");
-    }
     fs::create_dir_all(output_root)?;
+    let resolved_model = resolve_model_path(model, output_root)?;
     let run_id = requested_run_id.map(str::to_owned).unwrap_or_else(|| {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         format!("run-{nanos:x}")
@@ -686,7 +928,7 @@ fn run_gguf_matrix(
         let _ = fs::create_dir_all(&artifact_dir);
         store_run_result(&database, &run_id, &variant, "running", None, None, None, None, None, None, None, None, None, None)?;
         let attempt = (|| -> Result<(PathBuf, Option<f64>, Option<Value>)> {
-            let artifact = quantize_gguf_native(model, &variant, &artifact_dir)?;
+            let artifact = quantize_gguf_native(&resolved_model.to_string_lossy(), &variant, &artifact_dir)?;
             let perplexity = eval_text.map(|path| perplexity_gguf(&artifact, path)).transpose()?;
             let metrics = if benchmark == Some("llama.cpp") {
                 Some(llama_bench_one(&artifact, repeats, prompt_tokens, generation_tokens, kv_cache_dtype, batch_size)?)
@@ -715,6 +957,21 @@ fn run_gguf_matrix(
     println!("Results database: {}", output_root.join("results.sqlite").display());
     if failures > 0 { bail!("{failures} quantization matrix item(s) failed."); }
     Ok(())
+}
+
+fn resolve_model_path(model: &str, output_root: &std::path::Path) -> Result<PathBuf> {
+    let local = PathBuf::from(model);
+    if local.is_file() || local.is_dir() { return Ok(local); }
+    if !model.contains('/') { bail!("Model path does not exist: {model}"); }
+    let hf = find_executable("hf").context("Model ID download requires the Hugging Face CLI ('hf')")?;
+    let cache = output_root.join("model-cache").join(model.replace('/', "--"));
+    fs::create_dir_all(&cache)?;
+    let downloaded = Command::new(hf).args(["download", model, "--local-dir"]).arg(&cache).output()
+        .context("Could not start Hugging Face model download")?;
+    if !downloaded.status.success() {
+        bail!("Hugging Face model download failed: {}", String::from_utf8_lossy(&downloaded.stderr));
+    }
+    Ok(cache)
 }
 
 fn create_run_schema(connection: &Connection) -> Result<()> {
@@ -906,6 +1163,40 @@ mod tests {
     fn parses_perplexity_from_tool_output() {
         assert_eq!(parse_perplexity("perplexity = 2.75\n"), Some(2.75));
         assert_eq!(parse_perplexity("no metric found"), None);
+    }
+
+    #[test]
+    fn decodes_half_precision_values() {
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xbc00), -1.0);
+    }
+
+    #[test]
+    fn ranks_safetensors_weights_without_loading_full_model() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let weights = directory.path().join("model.safetensors");
+        let mut header = br#"{"dense.weight":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}"#.to_vec();
+        while header.len() % 8 != 0 { header.push(b' '); }
+        let mut file = fs::File::create(&weights).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        for value in [1.0f32, 0.5, -1.0, -0.5] { file.write_all(&value.to_le_bytes()).unwrap(); }
+        let output = directory.path().join("sensitivity.json");
+        sensitivity_safetensors(directory.path(), "2,4", 2, &output).unwrap();
+        let result: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(result["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(result["layers"][0]["name"], "dense");
+    }
+
+    #[test]
+    fn loads_flat_yaml_run_configs_and_method_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("run.yaml");
+        fs::write(&config_path, "model: org/model\nmethods:\n  - gguf:Q4_K_M\n  - gguf:Q5_K_M\nrepeats: 2\n").unwrap();
+        let config = load_run_config(&config_path).unwrap();
+        assert_eq!(config_string(Some(&config), "methods").as_deref(), Some("gguf:Q4_K_M,gguf:Q5_K_M"));
+        assert_eq!(config_usize(Some(&config), "repeats"), Some(2));
     }
 
     #[test]
