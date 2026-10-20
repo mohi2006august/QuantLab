@@ -1,10 +1,10 @@
 # QuantLab
 
-QuantLab runs reproducible local LLM quantization matrices, measures quality and throughput, and builds Pareto reports with hardware-aware recommendations. The Rust CLI is the primary entry point for planning; advanced quantization and evaluation commands currently use the Python compatibility backend because their upstream GPU libraries are Python-based. GPU operations use optional backends; install only the extras your hardware and workflow need.
+QuantLab runs reproducible local LLM quantization matrices, measures quality and throughput, and builds Pareto reports with hardware-aware recommendations. The Rust CLI is the primary entry point. GPU operations use optional backends; install only the extras your hardware and workflow need.
 
 ## Rust CLI
 
-Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. The Rust CLI implements `doctor`, `estimate`, `recommend`, local GGUF quantization matrices (`run`), SQLite-backed HTML `report`, and llama.cpp `benchmark` natively. BnB/GPTQ/AWQ/FP8 runs, model `evaluate`, activation `sensitivity`, Hub `publish`, YAML configs, and vLLM benchmarking still use the Python compatibility backend because they depend on Python ML libraries or Hub clients. Both Rust and Python test workflows run in GitHub Actions.
+Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. The Rust CLI implements `doctor`, `estimate`, `recommend`, local GGUF quantization matrices (`run`), SQLite-backed HTML `report`, llama.cpp `benchmark`, GGUF `evaluate`, and Hub `publish` natively. BnB/GPTQ/AWQ/FP8 runs, Transformers/lm-eval evaluation, activation `sensitivity`, YAML configs, and vLLM benchmarking still use the Python compatibility backend because they depend on Python ML libraries. Both Rust and Python test workflows run in GitHub Actions.
 
 ## Quick start
 
@@ -12,10 +12,10 @@ Install the Rust toolchain, then run `cargo run --release -- estimate --model Qw
 cargo run --release -- doctor
 cargo run --release -- recommend --model Qwen2.5-14B --device m3pro18
 cargo run --release -- estimate --parameters-b 14 --format Q4_K_M --device-memory-gb 18
-cargo run --release -- run --model Qwen/Qwen2.5-0.5B --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
+cargo run --release -- run --model .\models\qwen.gguf --methods gguf:Q4_K_M --device rtx4090 --benchmark llama.cpp
 ```
 
-Advanced Python-backed commands need the compatibility package installed with `python -m pip install -e .` and the relevant optional dependencies.
+Native Rust GGUF workflows need llama.cpp executables on `PATH`; converting a Hugging Face model folder also needs `LLAMA_CPP_DIR`. The Python compatibility package (`python -m pip install -e .`) remains available for optional GPU backends and evaluations not yet ported to Rust.
 
 You can pass a parameter count directly when it cannot be inferred from the model name:
 
@@ -27,7 +27,7 @@ Built-in device profiles are stored in `devices/`. Use `--device-memory-gb` to e
 
 ## Quantization matrix
 
-`run` accepts a local Hugging Face model directory, a GGUF file, or a Hugging Face model ID. GGUF conversion requires llama.cpp (`llama-quantize`, `llama-perplexity`, `llama-bench`) and `LLAMA_CPP_DIR` pointing to its source checkout for the converter. bitsandbytes can load Hugging Face IDs directly. GPTQ and AWQ runs require a calibration file containing one sample per line, or JSON/JSONL text records. The FP8 backend uses llm-compressor's dynamic FP8 recipe and does not require calibration text. YAML/JSON configuration files let you keep a run matrix reproducible.
+The Rust `run` command currently accepts local Hugging Face model folders or GGUF files and runs GGUF quantization. The Python compatibility command also accepts Hugging Face model IDs and supports the other quantizers. GGUF conversion requires llama.cpp (`llama-quantize`, `llama-perplexity`, `llama-bench`) and `LLAMA_CPP_DIR` pointing to its source checkout for the converter. bitsandbytes can load Hugging Face IDs directly. GPTQ and AWQ runs require a calibration file containing one sample per line, or JSON/JSONL text records. The FP8 backend uses llm-compressor's dynamic FP8 recipe and does not require calibration text. YAML/JSON configuration files let you keep a Python-backed run matrix reproducible.
 
 ```powershell
 quantlab run --model .\models\my-model --methods gguf:Q4_K_M,gguf:Q5_K_M --device rtx4090 --eval-text .\data\wiki.test.raw --benchmark llama.cpp --kv-cache-dtype q8_0 --batch-size 2048 --prompt-tokens 512 --generation-tokens 128
@@ -41,9 +41,9 @@ Each matrix run records states and metrics in `quantlab-runs/results.sqlite` and
 
 ## Evaluation and analysis
 
-`evaluate` supports sliding-window perplexity, custom JSON prompt suites, and tasks from lm-evaluation-harness. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. Pass `--judge-model` to run an optional local model judge against expected answers. `benchmark` measures repeated generation throughput with llama.cpp or vLLM and can vary KV cache precision. Use `--batch-sizes`, `--prompt-token-sizes`, `--generation-token-sizes`, and `--kv-cache-dtypes` for a Cartesian parameter sweep. It samples per-process NVIDIA memory when `nvidia-smi` exposes it; vLLM versions that expose request metrics report TTFT, while llama.cpp reports a prefill-time estimate separately. `sensitivity` ranks linear layers by groupwise quantization error; add `--calibration-file` to use activation-weighted diagonal error estimates from representative calibration text.
+Rust `evaluate` supports GGUF perplexity and JSON prompt suites through llama.cpp. The Python compatibility command additionally supports Transformers sliding-window perplexity and lm-evaluation-harness tasks. Prompt suites accept objects with `prompt`, optional `expected`, and optional `id`; exact match is reported only for entries with an expected answer. Python-backed evaluation can pass `--judge-model` for local judging. Rust `benchmark` measures llama.cpp throughput; the Python command additionally supports vLLM. Use `--batch-sizes`, `--prompt-token-sizes`, `--generation-token-sizes`, and `--kv-cache-dtypes` for a Cartesian parameter sweep. `sensitivity` currently remains Python-backed and ranks layers by groupwise quantization error; add `--calibration-file` for activation-weighted diagonal estimates.
 
-`publish` uploads a local artifact folder to Hugging Face Hub using `HF_TOKEN` and requires the source model's license identifier to create a model card. Check the model and dataset licenses before publishing. It is an explicit separate command and is not invoked by `run`.
+Rust and Python `publish` upload a local artifact folder to Hugging Face Hub using `HF_TOKEN` and require the source model's license identifier to create a model card. Check the model and dataset licenses before publishing. Publishing is an explicit separate command and is not invoked by `run`.
 
 ## Optional dependencies
 

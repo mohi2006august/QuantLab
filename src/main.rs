@@ -104,6 +104,40 @@ enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    Evaluate {
+        #[arg(long)]
+        model_path: PathBuf,
+        #[arg(long)]
+        text_file: Option<PathBuf>,
+        #[arg(long)]
+        prompt_suite: Option<PathBuf>,
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+        #[arg(long, default_value_t = 512)]
+        stride: usize,
+        #[arg(long)]
+        max_length: Option<usize>,
+        #[arg(long)]
+        tasks: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 1234)]
+        seed: u64,
+        #[arg(long)]
+        judge_model: Option<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    Publish {
+        #[arg(long)]
+        model_path: PathBuf,
+        #[arg(long)]
+        repo_id: String,
+        #[arg(long)]
+        license: String,
+        #[arg(long)]
+        private: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -139,7 +173,7 @@ fn main() {
 fn run() -> Result<()> {
     let raw_args: Vec<_> = env::args_os().skip(1).collect();
     if let Some(first) = raw_args.first().and_then(|value| value.to_str()) {
-        if ["evaluate", "sensitivity", "publish"].contains(&first) {
+        if first == "sensitivity" {
             return forward_legacy(&raw_args);
         }
         if first == "run" && ["--config", "--prompt-suite", "--judge-model", "--tasks", "--calibration-file", "--seed"]
@@ -212,6 +246,17 @@ fn run() -> Result<()> {
         ),
         Some(Commands::Report { run_id, output_dir, output }) => {
             report_command(&run_id, &output_dir, output.as_deref())
+        }
+        Some(Commands::Evaluate { model_path, text_file, prompt_suite, max_new_tokens, stride, max_length, tasks, limit, seed, judge_model, output }) => {
+            if tasks.is_some() || limit.is_some() || judge_model.is_some() || !is_gguf(&model_path) {
+                let raw_args: Vec<_> = env::args_os().skip(1).collect();
+                return forward_legacy(&raw_args);
+            }
+            let _ = (stride, seed);
+            evaluate_gguf(&model_path, text_file.as_deref(), prompt_suite.as_deref(), max_new_tokens, max_length, output.as_deref())
+        }
+        Some(Commands::Publish { model_path, repo_id, license, private }) => {
+            publish_with_hf_cli(&model_path, &repo_id, &license, private)
         }
         None => Ok(()),
     }
@@ -415,6 +460,132 @@ fn find_executable(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join(format!("{name}{suffix}")))
         .find(|candidate| candidate.is_file())
+}
+
+fn is_gguf(path: &std::path::Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn evaluate_gguf(
+    model: &std::path::Path,
+    text_file: Option<&std::path::Path>,
+    prompt_suite: Option<&std::path::Path>,
+    max_new_tokens: usize,
+    max_length: Option<usize>,
+    output_path: Option<&std::path::Path>,
+) -> Result<()> {
+    if text_file.is_none() && prompt_suite.is_none() {
+        bail!("Provide --text-file, --prompt-suite, or both.");
+    }
+    if max_new_tokens == 0 {
+        bail!("max-new-tokens must be at least one.");
+    }
+    let mut results = json!({});
+    if let Some(corpus) = text_file {
+        let executable = find_executable("llama-perplexity").context("llama-perplexity was not found on PATH")?;
+        let measured = Command::new(executable).args(["-m", &model.to_string_lossy(), "-f", &corpus.to_string_lossy(), "-c", &max_length.unwrap_or(2048).to_string()]).output()?;
+        if !measured.status.success() {
+            bail!("llama-perplexity failed: {}", String::from_utf8_lossy(&measured.stderr));
+        }
+        let text = format!("{}\n{}", String::from_utf8_lossy(&measured.stdout), String::from_utf8_lossy(&measured.stderr));
+        let perplexity = parse_perplexity(&text).context("Could not find perplexity in llama-perplexity output")?;
+        results["perplexity"] = json!({"perplexity": perplexity, "tokens": 0});
+    }
+    if let Some(suite_path) = prompt_suite {
+        let suite: Value = serde_json::from_slice(&fs::read(suite_path).context("Could not read prompt suite")?)?;
+        let items = suite.as_array().context("Prompt suite must be a JSON array")?;
+        if items.is_empty() { bail!("Prompt suite must contain at least one prompt."); }
+        let executable = find_executable("llama-cli").context("llama-cli was not found on PATH")?;
+        let mut outputs = Vec::new();
+        let mut exact_matches = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let prompt = item.get("prompt").and_then(Value::as_str).context("Each prompt-suite item needs a string 'prompt'")?;
+            let generated = Command::new(&executable).args(["-m", &model.to_string_lossy(), "-p", prompt, "-n", &max_new_tokens.to_string(), "--simple-io", "--no-display-prompt"]).output()?;
+            if !generated.status.success() {
+                bail!("llama-cli failed for prompt {index}: {}", String::from_utf8_lossy(&generated.stderr));
+            }
+            let completion = String::from_utf8_lossy(&generated.stdout).trim().to_owned();
+            let expected = item.get("expected").and_then(Value::as_str);
+            if let Some(expected) = expected {
+                exact_matches.push(completion.trim().eq_ignore_ascii_case(expected.trim()));
+            }
+            let exact_match = expected.map(|value| completion.trim().eq_ignore_ascii_case(value.trim()));
+            outputs.push(json!({
+                "id": item.get("id").cloned().unwrap_or_else(|| json!(index.to_string())),
+                "completion": completion,
+                "exact_match": exact_match,
+                "judge_pass": null,
+            }));
+        }
+        let score = if exact_matches.is_empty() { Value::Null } else { json!(exact_matches.iter().filter(|value| **value).count() as f64 / exact_matches.len() as f64) };
+        results["custom"] = json!({
+            "count": outputs.len(),
+            "exact_match_score": score,
+            "scored_count": exact_matches.len(),
+            "judge_score": null,
+            "judge_scored_count": 0,
+            "results": outputs,
+        });
+    }
+    let rendered = serde_json::to_string_pretty(&results)?;
+    println!("{rendered}");
+    if let Some(path) = output_path { fs::write(path, format!("{rendered}\n"))?; }
+    Ok(())
+}
+
+fn parse_perplexity(output: &str) -> Option<f64> {
+    output.lines().rev().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let marker = lower.find("perplexity").map(|index| index + "perplexity".len())
+            .or_else(|| lower.find("ppl").map(|index| index + 3))?;
+        line[marker..].split(|character: char| !(character.is_ascii_digit() || character == '.' || character == '-'))
+            .find_map(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value > 0.0)
+    })
+}
+
+fn publish_with_hf_cli(model_path: &std::path::Path, repo_id: &str, license: &str, private: bool) -> Result<()> {
+    if !model_path.exists() { bail!("Model path does not exist: {}", model_path.display()); }
+    if env::var_os("HF_TOKEN").is_none() { bail!("Set HF_TOKEN in the environment before publishing."); }
+    if !license.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-')) || license.is_empty() {
+        bail!("Provide a simple SPDX license identifier.");
+    }
+    let (owner, name) = repo_id.split_once('/').context("Repository ID must have the form owner/name")?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') || !repo_id.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/')) {
+        bail!("Invalid Hugging Face repository ID.");
+    }
+    let hf = find_executable("hf").context("Hugging Face CLI 'hf' was not found; install huggingface_hub")?;
+    let mut create = Command::new(&hf);
+    create.args(["repo", "create", repo_id, "--type", "model", "--exist-ok"]);
+    if private { create.arg("--private"); } else { create.arg("--public"); }
+    let created = create.output().context("Could not start Hugging Face CLI")?;
+    if !created.status.success() {
+        bail!("Could not create or access Hub repository: {}", String::from_utf8_lossy(&created.stderr));
+    }
+    let mut upload = Command::new(&hf);
+    upload.arg("upload").arg(repo_id).arg(model_path);
+    if model_path.is_file() {
+        upload.arg(model_path.file_name().context("Model file has no filename")?);
+    } else {
+        upload.arg(".");
+    }
+    upload.arg("--commit-message").arg("Publish quantized model with QuantLab");
+    let uploaded = upload.output().context("Could not start model upload")?;
+    if !uploaded.status.success() {
+        bail!("Hub upload failed: {}", String::from_utf8_lossy(&uploaded.stderr));
+    }
+    let has_card = model_path.is_dir() && model_path.join("README.md").is_file();
+    if !has_card {
+        let card_path = env::temp_dir().join(format!("quantlab-model-card-{}.md", process::id()));
+        let card = format!("---\nlicense: {license}\nlibrary_name: quantlab\ntags:\n  - quantization\n  - quantlab\n---\n\n# {name}\n\nQuantized model artifact published with QuantLab.\n\nConfirm the upstream model and calibration data licenses permit redistribution. Document the source model, quantization settings, and evaluation results before sharing.\n");
+        fs::write(&card_path, card)?;
+        let card_upload = Command::new(&hf).args(["upload", repo_id]).arg(&card_path).arg("README.md").args(["--commit-message", "Add QuantLab model card"]).output()?;
+        let _ = fs::remove_file(&card_path);
+        if !card_upload.status.success() {
+            bail!("Hub model-card upload failed: {}", String::from_utf8_lossy(&card_upload.stderr));
+        }
+    }
+    println!("https://huggingface.co/{repo_id}");
+    Ok(())
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -729,6 +900,12 @@ mod tests {
         assert_eq!(parse_usize_list(Some("1, 4,8"), 2).unwrap(), vec![1, 4, 8]);
         assert!(parse_usize_list(Some("1,0"), 2).is_err());
         assert!(parse_string_list(Some("f16,"), "auto").is_err());
+    }
+
+    #[test]
+    fn parses_perplexity_from_tool_output() {
+        assert_eq!(parse_perplexity("perplexity = 2.75\n"), Some(2.75));
+        assert_eq!(parse_perplexity("no metric found"), None);
     }
 
     #[test]
