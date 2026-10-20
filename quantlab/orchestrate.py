@@ -81,11 +81,15 @@ def run_matrix(
         "repeats": repeats,
         "seed": seed,
     }
-    if store.run_exists(run_id):
-        existing = store.results(run_id)
-        configured = next((row for row in existing), None)
-        if configured:
-            print(f"Resuming run {run_id}; completed artifacts will be reused where available.")
+    existing_run = store.get_run(run_id)
+    if existing_run:
+        normalized_config = json.loads(json.dumps(config, sort_keys=True))
+        if existing_run["model"] != model or existing_run["device"] != device or existing_run["config"] != normalized_config:
+            raise ValueError(
+                f"Run {run_id!r} was created with a different configuration. "
+                "Use the original model, methods, and evaluation/benchmark options, or choose a new run ID."
+            )
+        print(f"Resuming run {run_id}; completed artifacts will be reused where available.")
     else:
         store.create_run(run_id, model, device, config)
 

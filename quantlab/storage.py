@@ -118,6 +118,17 @@ class RunStore:
         with self.connect() as connection:
             return connection.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is not None
 
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        run = dict(row)
+        run["config"] = json.loads(run.pop("config_json"))
+        return run
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
