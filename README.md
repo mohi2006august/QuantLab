@@ -6,6 +6,34 @@ QuantLab runs reproducible local LLM quantization matrices, measures quality and
 
 Install the Rust toolchain, then run `cargo run --release -- estimate --model Qwen2.5-14B --format Q4_K_M --device rtx4090` or build an executable with `cargo build --release`. Rust owns the CLI, orchestration, persistence, and reporting. Local Llama, Mistral, Qwen2, Qwen3, Gemma, Gemma 2, Phi, and Phi-3 safetensors evaluation uses Candle in Rust. BnB/GPTQ/AWQ/FP8 quantization, lm-eval, vLLM, judging for unsupported models, and activation-captured sensitivity retain narrow Python adapters for their upstream ML implementations; they no longer re-enter the Python CLI. Both Rust and Python test workflows run in GitHub Actions.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    User[User] --> CLI[Rust CLI]
+    CLI --> Matrix[Run matrix]
+    CLI --> Direct[Evaluate / benchmark]
+    CLI --> Utilities[Estimate / recommend]
+    CLI --> Sensitivity[Sensitivity]
+    CLI --> Publish[Publish]
+
+    Matrix --> Quantize{Quantization method}
+    Quantize -->|GGUF| LlamaCpp[llama.cpp tools]
+    Quantize -->|BnB / GPTQ / AWQ / FP8| PyQuant[Python quantization adapters]
+    Matrix --> Evaluate{Evaluation / benchmark backend}
+    Direct --> Evaluate
+    Evaluate -->|GGUF| LlamaCpp
+    Evaluate -->|Supported safetensors| Candle[Candle Rust inference<br/>Llama · Mistral · Qwen2/3<br/>Gemma/2 · Phi/3]
+    Evaluate -->|Other models / lm-eval| PyEval[Python Transformers / lm-eval adapters]
+    Evaluate -->|vLLM benchmark| Vllm[Python vLLM adapter]
+
+    Matrix --> Results[(SQLite run results)]
+    Results --> Reports[HTML / Pareto reports]
+    Sensitivity --> Weight[Native Rust weight analysis]
+    Sensitivity --> Activation[Python activation capture]
+    Publish --> Hub[Hugging Face Hub via hf CLI]
+```
+
 ## Quick start
 
 ```powershell
